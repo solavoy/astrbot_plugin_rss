@@ -6,6 +6,7 @@ import uuid
 
 from ..core.errors import FeedFetchError
 from ..core.feed_urls import build_feed_request, is_relative_feed_reference, normalize_relative_feed_reference
+from ..core.intervals import parse_interval_seconds
 from ..core.models import Feed
 from ..core.security import validate_public_url
 
@@ -13,9 +14,7 @@ from ..core.security import validate_public_url
 def normalize_poll_interval(value):
     if value is None:
         return None
-    if type(value) is not int or value < 0:
-        raise ValueError("poll_interval must be a non-negative integer")
-    return value or None
+    return parse_interval_seconds(value) or None
 
 
 def _public_id_ref(value: str) -> int | None:
@@ -82,7 +81,7 @@ class _Feeds:
         url: str,
         title: str = "",
         description: str = "",
-        poll_interval: int | None = None,
+        poll_interval: int | str | None = None,
         translation_enabled: bool = False,
     ):
         if type(translation_enabled) is not bool:
@@ -208,7 +207,7 @@ class _Subscriptions:
     def __init__(self, service):
         self.s = service
 
-    async def subscribe(self, target_id: str, feed_id: str, interval: int | None = None):
+    async def subscribe(self, target_id: str, feed_id: str, interval: int | str | None = None):
         interval = normalize_poll_interval(interval)
         return await self.s.repo.add_direct_subscription(
             target_id, feed_id, interval, self.s.runtime.config.first_subscription_send_history
@@ -245,7 +244,7 @@ class _Lists:
             raise KeyError(ref)
         return matches[0]
 
-    async def create(self, name: str, description: str = "", interval: int | None = None):
+    async def create(self, name: str, description: str = "", interval: int | str | None = None):
         interval = normalize_poll_interval(interval)
         if not isinstance(name, str):
             raise ValueError("list name must be a string")
@@ -283,7 +282,7 @@ class _Lists:
     async def remove_feed(self, list_id: str, feed_id: str):
         return await self.s.repo.remove_list_feed(list_id, feed_id)
 
-    async def subscribe(self, target_id: str, list_id: str, interval: int | None = None):
+    async def subscribe(self, target_id: str, list_id: str, interval: int | str | None = None):
         interval = normalize_poll_interval(interval)
         return await self.s.repo.subscribe_list(
             target_id, list_id, interval, self.s.runtime.config.first_subscription_send_history

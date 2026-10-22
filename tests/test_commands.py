@@ -88,7 +88,7 @@ def test_command_handlers_are_owned_by_plugin_main_module(monkeypatch):
 
     assert inspect.signature(main.RSSPlugin._rss_sub).parameters["url"].default == ""
     assert main.RSSPlugin.astrbot_metadata[2] == "RSS 订阅推送"
-    assert main.RSSPlugin.astrbot_metadata[3] == "1.0.0"
+    assert main.RSSPlugin.astrbot_metadata[3] == "1.1.0"
     assert main.RSSPlugin.rss.__doc__
     assert "/rss sub <源 ID、公开 RSS/Atom 地址或 RSSHub 相对路径>" in main.RSSPlugin._rss_sub.__doc__
     assert "/rss 订阅 <源 ID、公开 RSS/Atom 地址或 RSSHub 相对路径>" in main.RSSPlugin._rss_sub.__doc__

@@ -35,17 +35,17 @@ def test_business_import_export_roundtrip_and_relationship_validation(tmp_path, 
                     "title": "Example",
                     "description": "feed",
                     "enabled": False,
-                    "poll_interval": 0,
+                    "poll_interval": "0d",
                 }
             ],
-            "subscription_lists": [{"list_id": "l-1", "name": "List", "enabled": False, "poll_interval": 0}],
+            "subscription_lists": [{"list_id": "l-1", "name": "List", "enabled": False, "poll_interval": "0h"}],
             "list_feeds": [{"list_id": "l-1", "feed_id": "f-1"}],
             "targets": [{"target_id": "target-1"}],
             "direct_subscriptions": [
-                {"target_id": "target-1", "feed_id": "f-1", "enabled": False, "poll_interval": 0},
+                {"target_id": "target-1", "feed_id": "f-1", "enabled": False, "poll_interval": "0m"},
                 {"target_id": "missing-target", "feed_id": "f-1", "enabled": True, "poll_interval": None},
             ],
-            "list_subscriptions": [{"target_id": "target-1", "list_id": "l-1", "enabled": True, "poll_interval": 0}],
+            "list_subscriptions": [{"target_id": "target-1", "list_id": "l-1", "enabled": True, "poll_interval": "0s"}],
         }
         path = tmp_path / "business.json"
         path.write_text(json.dumps(payload), encoding="utf-8")
@@ -115,6 +115,56 @@ def test_business_import_export_roundtrip_and_relationship_validation(tmp_path, 
         after = await runtime.database.fetchone("SELECT count(*) FROM subscription_lists")
         assert before[0] == after[0] == 1
         await runtime.close()
+
+    asyncio.run(run())
+
+
+def test_business_import_normalizes_units_and_validates_before_mutation(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    import astrbot_plugin_rss.services.management as management_module
+
+    async def validate(url):
+        return SimpleNamespace(url=url)
+
+    monkeypatch.setattr(management_module, "validate_public_url", validate)
+
+    async def run():
+        runtime = RSSRuntime({}, tmp_path / "data")
+        await runtime.initialize()
+        try:
+            target = await runtime.repository.create_target("instance", "origin", "test", "session")
+            service = ManagementService(runtime)
+            payload = {
+                "feeds": [{"feed_id": "feed", "url": "https://example.org/units", "poll_interval": "1d"}],
+                "subscription_lists": [{"list_id": "list", "name": "Units", "poll_interval": " 2 H "}],
+                "direct_subscriptions": [{"target_id": target.target_id, "feed_id": "feed", "poll_interval": "3m"}],
+                "list_subscriptions": [{"target_id": target.target_id, "list_id": "list", "poll_interval": "120s"}],
+            }
+            path = tmp_path / "units.json"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            await service._import_json(path)
+            exported = await service._business_export()
+            expected = {
+                "feeds": 86400,
+                "subscription_lists": 7200,
+                "direct_subscriptions": 180,
+                "list_subscriptions": 120,
+            }
+            for key, seconds in expected.items():
+                assert exported[key][0]["poll_interval"] == seconds
+
+            for key in expected:
+                original = payload[key][0]["poll_interval"]
+                for invalid in (True, "1h30m", "1.5d", "1w", "-1s"):
+                    payload[key][0]["poll_interval"] = invalid
+                    path.write_text(json.dumps(payload), encoding="utf-8")
+                    with pytest.raises(ValueError):
+                        await service._import_json(path)
+                    assert await service._business_export() == exported
+                payload[key][0]["poll_interval"] = original
+        finally:
+            await runtime.close()
 
     asyncio.run(run())
 

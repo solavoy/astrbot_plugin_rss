@@ -4,7 +4,6 @@ import importlib.util
 import json
 import logging
 import math
-import re
 from collections.abc import MutableMapping
 from dataclasses import dataclass, field, fields
 from pathlib import Path, PurePath
@@ -14,6 +13,7 @@ from zoneinfo import TZPATH, ZoneInfo, ZoneInfoNotFoundError
 
 from .errors import ConfigurationError
 from .feed_urls import validate_default_url_prefix
+from .intervals import parse_interval_seconds
 
 DEFAULT_TRANSLATION_PROMPT = """你是一名专业的 RSS 内容翻译者。目标语言：[简体中文]。
 
@@ -54,17 +54,13 @@ _LOGGER = logging.getLogger(__name__)
 
 
 def _normalize_group_value(key: str, value: Any) -> tuple[Any, bool]:
-    """Normalize supported dashboard numeric strings without weakening validation."""
+    """Normalize supported dashboard intervals and numeric strings."""
     if key == "global_poll_interval":
-        if type(value) is int:
-            return value, value > 0
-        if isinstance(value, str) and re.fullmatch(r"[0-9]+", value.strip(), flags=re.ASCII):
-            try:
-                normalized = int(value.strip())
-            except ValueError:
-                return value, False
-            return normalized, normalized > 0
-        return value, False
+        try:
+            normalized = parse_interval_seconds(value)
+        except ValueError:
+            return value, False
+        return normalized, normalized > 0
     if key == "request_timeout":
         if isinstance(value, bool):
             return value, False
@@ -224,7 +220,7 @@ class PluginConfig:
     request_retry_limit: int = 3
     enable_etag_cache: bool = True
     max_feed_response_bytes: int = 5_000_000
-    fetch_user_agent: str = "astrbot-plugin-rss/1.0.0"
+    fetch_user_agent: str = "astrbot-plugin-rss/1.1.0"
     enable_cloakbrowser: bool = False
     browser_allowed_domains: tuple[str, ...] = ()
     enable_cookie_persistence: bool = True
@@ -404,8 +400,9 @@ class PluginConfig:
         for name in bool_fields:
             if type(getattr(self, name)) is not bool:
                 raise ConfigurationError(f"配置项 {name} 必须是布尔值")
+        if type(self.global_poll_interval) is not int or self.global_poll_interval <= 0:
+            raise ConfigurationError("抓取间隔必须至少 1 秒，支持 d/h/m/s 单位（天/时/分/秒），无单位按秒")
         positive_ints = {
-            "global_poll_interval",
             "min_poll_interval",
             "max_fetch_concurrency",
             "max_feed_response_bytes",

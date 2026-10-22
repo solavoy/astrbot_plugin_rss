@@ -569,8 +569,8 @@
                       <span>
                         抓取间隔
                       </span>
-                      <input type="number" min="0" step="1" v-model="feedInterval">
-                      <small class="field-hint">0 表示继承全局，单位秒</small>
+                      <input type="text" v-model="feedInterval" placeholder="例如 1d、2h、30m、45s">
+                      <small class="field-hint">d 天 / h 时 / m 分 / s 秒；无单位按秒，0 表示继承全局</small>
                     </label>
                     <label class="toggle-row">
                       <span>
@@ -653,9 +653,9 @@
                     <input v-model="listName" maxlength="120">
                   </label>
                   <label class="field">
-                      <span>检查周期（秒）</span>
-                      <input type="number" min="0" step="1" v-model="listInterval">
-                      <small class="field-hint">0 表示继承全局，单位秒</small>
+                      <span>检查周期</span>
+                      <input type="text" v-model="listInterval" placeholder="例如 1d、2h、30m、45s">
+                      <small class="field-hint">d 天 / h 时 / m 分 / s 秒；无单位按秒，0 表示继承全局</small>
                   </label>
                   <label class="field full-span">
                     <span>
@@ -782,9 +782,9 @@
                         <input v-model="editListName" maxlength="120">
                       </label>
                       <label class="field">
-                        <span>检查周期（秒）</span>
-                        <input type="number" min="0" step="1" v-model="editListInterval">
-                        <small class="field-hint">0 表示继承全局，单位秒</small>
+                        <span>检查周期</span>
+                        <input type="text" v-model="editListInterval" placeholder="例如 1d、2h、30m、45s">
+                        <small class="field-hint">d 天 / h 时 / m 分 / s 秒；无单位按秒，0 表示继承全局</small>
                       </label>
                       <label class="field full-span">
                         <span>

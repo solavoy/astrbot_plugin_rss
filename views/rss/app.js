@@ -1,4 +1,6 @@
 /* Plain JavaScript client for the authenticated AstrBot Plugin View bridge. */
+const INTERVAL_ERROR = '抓取间隔需为非负整数，可带 d/h/m/s（天/时/分/秒），无单位按秒，0 表示继承全局';
+
 function isPublicFeedUrl(value) {
     return /^https?:\/\//i.test(value);
 }
@@ -107,10 +109,15 @@ function App() {
             return `${resource}/${encodeURIComponent(this.routeId())}${suffix}`;
         },
         parseInterval(value) {
-            if (value === '' || value === '0' || value === 0)
+            if (typeof value !== 'string' && typeof value !== 'number')
+                return undefined;
+            const text = String(value).trim();
+            if (text === '')
                 return null;
-            const seconds = Number(value);
-            return Number.isInteger(seconds) && seconds >= 1 ? seconds : undefined;
+            const match = /^([0-9]+)[ \t\r\n\f\v]*([dhms]?)$/i.exec(text);
+            if (!match)
+                return undefined;
+            return /^0+$/.test(match[1]) ? null : text;
         },
         async get(ep, params) {
             return await this.bridge.apiGet(ep, params || {});
@@ -378,7 +385,7 @@ function App() {
             }
             let interval = this.parseInterval(this.listInterval);
             if (interval === undefined) {
-                this.error = '周期需为 0 或至少 1 秒的整数';
+                this.error = INTERVAL_ERROR;
                 return;
             }
             await this.perform(async () => {
@@ -425,7 +432,7 @@ function App() {
             this.notice = '';
             let v = this.parseInterval(this.feedInterval);
             if (v === undefined) {
-                this.error = '间隔需为 0 或至少 1 秒的整数';
+                this.error = INTERVAL_ERROR;
                 return;
             }
             await this.perform(async () => { await this.post(this.detailEndpoint('feeds', '/update'), { enabled: this.feedEnabled, poll_interval: v, translation_enabled: this.feedTranslationEnabled }); this.notice = '订阅源设置已保存'; await this.load(); });
@@ -480,7 +487,7 @@ function App() {
             }
             let interval = this.parseInterval(this.editListInterval);
             if (interval === undefined) {
-                this.error = '周期需为 0 或至少 1 秒的整数';
+                this.error = INTERVAL_ERROR;
                 return;
             }
             await this.perform(async () => { await this.post(this.detailEndpoint('lists', '/update'), { name: this.editListName.trim(), description: this.editListDescription.trim(), enabled: !!this.editListEnabled, poll_interval: interval }); this.notice = '列表设置已保存'; await this.load(); });

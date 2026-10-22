@@ -1,7 +1,7 @@
 name: astrbot_plugin_rss
 display_name: RSS 订阅推送
 desc: RSS/Atom 订阅、内容整理与多平台可靠推送。
-version: 1.0.0
+version: 1.1.0
 author: solavoy
 repo: https://github.com/solavoy/astrbot_plugin_rss.git
 astrbot_version: ">=4.29.0"

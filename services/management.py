@@ -20,6 +20,7 @@ from ..core.feed_urls import build_feed_request, is_relative_feed_reference, nor
 from ..core.security import validate_public_url
 from ..storage.database import Database
 from ..storage.management_repository import ManagementRepository
+from .facade import normalize_poll_interval
 
 
 class ManagementService:
@@ -327,7 +328,11 @@ class ManagementService:
             translation_enabled = body.get("translation_enabled", False)
             if type(translation_enabled) is not bool:
                 raise ValueError("translation_enabled must be boolean")
-            feed = await self.services.feeds.create(url, translation_enabled=translation_enabled)
+            feed = await self.services.feeds.create(
+                url,
+                poll_interval=self._interval(body.get("poll_interval")),
+                translation_enabled=translation_enabled,
+            )
             await self.services.subscriptions.subscribe(target_id, feed.feed_id)
             return {"feed": feed}
         if endpoint.startswith("feeds/"):
@@ -613,13 +618,12 @@ class ManagementService:
             for row in payload.get(key, []):
                 if not isinstance(row, dict):
                     raise ValueError(f"{key} rows must be objects")
-                interval = row.get("poll_interval")
-                if interval == 0 and type(interval) is int:
-                    row["poll_interval"] = None
-                elif interval is not None and (
-                    type(interval) is not int or interval < self.runtime.config.min_poll_interval
-                ):
-                    raise ValueError(f"{key} poll_interval must be a non-negative integer")
+                interval = self._interval(row.get("poll_interval"))
+                if interval is not None and interval < self.runtime.config.min_poll_interval:
+                    raise ValueError(
+                        f"{key} poll_interval must be at least {self.runtime.config.min_poll_interval} seconds"
+                    )
+                row["poll_interval"] = interval
                 if "enabled" in row and type(row["enabled"]) is not bool:
                     raise ValueError(f"{key} enabled must be boolean")
                 if key == "feeds" and "translation_enabled" in row and type(row["translation_enabled"]) is not bool:
@@ -1283,8 +1287,4 @@ class ManagementService:
         return value
 
     def _interval(self, value):
-        if value is None:
-            return None
-        if type(value) is not int or value < 0:
-            raise ValueError("poll_interval must be a non-negative integer")
-        return value or None
+        return normalize_poll_interval(value)

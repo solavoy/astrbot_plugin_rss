@@ -21,6 +21,8 @@ git diff --check
 
 回归用例覆盖插件元数据中的 `telegram` 与 `lark` 平台声明，以及 Discourse/Linux.do RSS 自动生成标题锚点的清理；标题文字、普通 hash 链接和跨站同形链接会保留。
 
+抓取间隔回归覆盖 `d`、`h`、`m`、`s` 换算、大小写与空白、无单位默认秒、旧整数配置及迁移优先级、源和列表的零值继承，以及非法输入拒绝。服务、管理 API 和 JSON 导入统一按秒存储，导入验证失败不会产生部分写入。WebUI 通过 Node VM 检查解析边界及源保存、列表创建和列表保存三个入口的提交与非法输入阻断。
+
 ## 本地集成核对
 
 本地集成测试使用 fake AI/provider 和文章数据，确认配置提示词作为模型系统提示，RSS 标题和正文作为独立用户输入；默认目标语言为 `[简体中文]`，替换为 `[英语]` 后目标随之改变。已是目标语言的标题或段落只保留一次；不同提示词使用独立缓存，相同提示词可复用缓存。测试未调用真实 AI 服务。
@@ -31,7 +33,7 @@ Linux.do 的标题锚点经解析和旧缓存清理后，在默认渲染、飞�
 
 ## 当前最终结果
 
-2026-10-22 全量检查为 `346 passed, 7 warnings`。其中 6 条为 Windows Proactor/curl_cffi selector 提示，1 条为 feedparser 弃用提示。`ruff check .` 通过，`ruff format --check .` 确认 89 个文件已格式化，`node --check views/rss/app.js` 与 `git diff --check` 通过。
+2026-10-22 全量检查为 `401 passed, 7 warnings`。其中 6 条为 Windows Proactor/curl_cffi selector 提示，1 条为 feedparser 弃用提示。`ruff check .` 通过，`ruff format --check .` 确认 91 个文件已格式化，`node --check views/rss/app.js` 与 `git diff --check` 通过。
 
 ## 尚未覆盖的真实环境
 

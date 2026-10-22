@@ -21,14 +21,14 @@
 | POST endpoint                    | 请求/行为                                                                                                                                                         |
 | -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | scheduler                        | action=pause/resume/check；全局运行状态持久化                                                                                                                           |
-| feeds/create                     | url,target_id,translation_enabled?；url 可为完整 HTTP(S) 地址或以 `/` 开头的相对路由；验证有效请求地址并建立直接订阅，目标必须为已登记目标；`translation_enabled` 为可选布尔值，默认 `false`                       |
-| feeds/<feed_id>/update           | `enabled?`, `poll_interval?`, `translation_enabled?`；`translation_enabled` 为布尔值，省略时保持原值；间隔 0或null继承全局，正整数最小1秒，负数、小数或布尔值拒绝                                     |
+| feeds/create                     | url,target_id,poll_interval?,translation_enabled?；url 可为完整 HTTP(S) 地址或以 `/` 开头的相对路由；验证有效请求地址并建立直接订阅，目标必须为已登记目标；间隔支持整数或带单一 d/h/m/s 单位的字符串，0 或 null 继承全局；`translation_enabled` 为可选布尔值，默认 `false` |
+| feeds/<feed_id>/update           | `enabled?`, `poll_interval?`, `translation_enabled?`；`translation_enabled` 为布尔值，省略时保持原值；间隔支持整数或带单一 d/h/m/s 单位的字符串，0 或 null 继承全局，保存为秒数或 NULL，详见下方规则 |
 | feeds/<feed_id>/refresh          | 手动强制抓取并遵守 HTTP 429 冷却；若请求等待期间同一源已有抓取完成，返回 `{feed_id,status:"skipped",reason:"concurrent_refresh"}`，不再重复请求                                                     |
 | feeds/<feed_id>/unsubscribe      | target_id；只删除相应直接关系                                                                                                                                           |
 | feeds/<feed_id>/preview          | target_id?；渲染预览，不发送；附带 timezone                                                                                                                               |
 | feeds/<feed_id>/test             | target_id；显式测试推送，通过可靠队列记录操作                                                                                                                                   |
-| lists/create                     | name,description?,poll_interval?；0或null继承全局                                                                                                                   |
-| lists/<list_id>/update           | name?,description?,enabled?,poll_interval?；0或null继承全局                                                                                                         |
+| lists/create                     | name,description?,poll_interval?；间隔支持整数或带单一 d/h/m/s 单位的字符串，0 或 null 继承全局，详见下方规则                                                           |
+| lists/<list_id>/update           | name?,description?,enabled?,poll_interval?；间隔支持整数或带单一 d/h/m/s 单位的字符串，0 或 null 继承全局，详见下方规则                                                |
 | lists/<list_id>/delete           | confirm=true；删除列表及自身关系，保留全局Feed和直接订阅                                                                                                                          |
 | lists/<list_id>/members/add      | feed_id或url（完整 HTTP(S) 地址或 `/` 开头的相对路由）；允许批量条目，设置加入基线                                                                                                         |
 | lists/<list_id>/members/remove   | feed_id；只删除成员关系                                                                                                                                               |
@@ -44,6 +44,8 @@
 | data/cleanup                     | confirm=true,kind=articles/history/cookies/media；不得破坏未处理积压                                                                                                    |
 | sessions/<session_id>/clear      | confirm=true；清除Cookie和browser profile                                                                                                                         |
 | sessions/<session_id>/refresh    | 显式重建已允许公开来源会话，仍然拒绝交互验证                                                                                                                                        |
+
+`poll_interval` 接受非负整数，或“非负整数 + 可选的单一单位”字符串：`d` 天、`h` 时、`m` 分、`s` 秒；忽略大小写并允许空白，未带单位按秒。例如 `"1d"`、`"2 H"`、`"30m"`、`"45s"`、`"300"` 或 `300`。`0`（含带单位的零）与 `null` 归一为继承全局的 `NULL`，正数转换为整数秒，返回与导出仍使用秒数。负数、小数、布尔值、未知单位和 `"1h30m"` 之类的组合单位均拒绝。全局配置 `fetch.global_poll_interval` 使用同一单位规则，但归一后必须至少 1 秒。
 
 分页默认20，最大100。请求体限制、类型、长度、日期、URL和目标存在性需要后端验证。前端使用表单校验、加载/空态/错误提示及危险操作确认；所有来源HTML通过有序块纯文本/安全组件显示，不直接v-html。
 

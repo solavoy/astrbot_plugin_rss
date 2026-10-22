@@ -49,10 +49,11 @@ async def test_feed_create_validates_before_insert_and_duplicate_does_not_refetc
     import asyncio
 
     created, concurrent = await asyncio.gather(
-        runtime.services.feeds.create("https://EXAMPLE.org/rss"),
+        runtime.services.feeds.create("https://EXAMPLE.org/rss", poll_interval="2h"),
         runtime.services.feeds.create("https://example.org/rss"),
     )
     assert created.initialized and created.title == "Verified"
+    assert created.poll_interval == 7200
     assert concurrent.feed_id == created.feed_id
     assert len(await runtime.list_feed_articles(created.feed_id)) == 1
     assert fetcher.calls == 1
@@ -60,6 +61,49 @@ async def test_feed_create_validates_before_insert_and_duplicate_does_not_refetc
     await runtime.services.subscriptions.subscribe(target.target_id, created.feed_id)
     assert await runtime.repository.pending_deliveries(10**9) == []
     await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_service_intervals_are_stored_as_seconds_and_zero_inherits(tmp_path):
+    runtime = RSSRuntime({}, tmp_path)
+    await runtime.initialize()
+    try:
+        feed = await runtime.repository.create_feed("https://example.org/interval-units")
+        target = await runtime.repository.create_target("instance", "origin", "test", "session")
+        list_id = await runtime.services.lists.create("Interval units", interval="2d")
+        assert (await runtime.repository.get_list(list_id))["poll_interval"] == 172800
+
+        updated = await runtime.services.feeds.update(feed.feed_id, poll_interval=" 3 H ")
+        assert updated.poll_interval == 10800
+        await runtime.services.lists.update(list_id, poll_interval="4m")
+        assert (await runtime.repository.get_list(list_id))["poll_interval"] == 240
+        await runtime.services.subscriptions.subscribe(target.target_id, feed.feed_id, interval="45s")
+        await runtime.services.lists.subscribe(target.target_id, list_id, interval="90")
+        assert (await runtime.repository.list_direct_subscriptions(target.target_id))[0]["poll_interval"] == 45
+        row = await runtime.database.fetchone("SELECT poll_interval FROM list_subscriptions")
+        assert row[0] == 90
+
+        for inherited in (0, "0", "0d", None):
+            updated = await runtime.services.feeds.update(feed.feed_id, poll_interval=inherited)
+            assert updated.poll_interval is None
+            await runtime.services.lists.update(list_id, poll_interval=inherited)
+            await runtime.services.subscriptions.subscribe(target.target_id, feed.feed_id, interval=inherited)
+            await runtime.services.lists.subscribe(target.target_id, list_id, interval=inherited)
+            for table in ("subscription_lists", "direct_subscriptions", "list_subscriptions"):
+                assert (await runtime.database.fetchone(f"SELECT poll_interval FROM {table}"))[0] is None
+
+        for invalid in (-1, True, 1.5, "-1h", "1h30m", "1.5d", "1w", ""):
+            with pytest.raises(ValueError):
+                await runtime.services.feeds.update(feed.feed_id, poll_interval=invalid)
+            with pytest.raises(ValueError):
+                await runtime.services.lists.update(list_id, poll_interval=invalid)
+            with pytest.raises(ValueError):
+                await runtime.services.subscriptions.subscribe(target.target_id, feed.feed_id, interval=invalid)
+            with pytest.raises(ValueError):
+                await runtime.services.lists.subscribe(target.target_id, list_id, interval=invalid)
+        assert (await runtime.repository.get_feed(feed.feed_id)).poll_interval is None
+    finally:
+        await runtime.close()
 
 
 @pytest.mark.asyncio

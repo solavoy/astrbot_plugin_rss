@@ -12,7 +12,7 @@ from .services.management import ManagementService
 from .web.api import WebAPI
 
 
-@register("astrbot_plugin_rss", "solavoy", "RSS 订阅推送", "1.0.0")
+@register("astrbot_plugin_rss", "solavoy", "RSS 订阅推送", "1.1.0")
 class RSSPlugin(RSSCommands, Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context)
@@ -106,7 +106,7 @@ class RSSPlugin(RSSCommands, Star):
         self._rss_runtime = runtime
         self._rss_management = management
         self._rss_web = web
-        logger.info("RSS 订阅推送运行时已启动 version=1.0.0；可用命令 /rss help")
+        logger.info("RSS 订阅推送运行时已启动 version=1.1.0；可用命令 /rss help")
 
     async def terminate(self):
         runtime = self._rss_runtime

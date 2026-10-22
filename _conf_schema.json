@@ -22,10 +22,10 @@
         "description": "抓取设置",
         "items": {
             "global_poll_interval": {
-                "type": "int",
-                "default": 300,
+                "type": "string",
+                "default": "300",
                 "description": "抓取间隔",
-                "hint": "全局抓取间隔，单位为秒，最少 1 秒。"
+                "hint": "支持 d（天）、h（时）、m（分）、s（秒），例如 1d、2h、30m、45s；无单位默认秒，最少 1 秒。"
             },
             "request_timeout": {
                 "type": "float",

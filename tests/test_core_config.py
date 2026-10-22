@@ -136,6 +136,8 @@ def test_plugin_config_schema_has_groups_and_legacy_keys():
     for key in ("global_poll_interval", "request_timeout", "proxy", "telegraph_access_token"):
         assert schema[key]["invisible"] is True
     assert schema["global_poll_interval"]["default"] == 0
+    assert schema["fetch"]["items"]["global_poll_interval"]["type"] == "string"
+    assert schema["fetch"]["items"]["global_poll_interval"]["default"] == "300"
     assert schema["request_timeout"]["default"] == 0.0
     assert schema["proxy"]["default"] == ""
     assert schema["telegraph_access_token"]["default"] == ""
@@ -359,6 +361,32 @@ def test_grouped_numeric_strings_are_normalized_and_invalid_values_rejected():
     for value in (True, -1, 0, "--1", "1.0", "１"):
         with pytest.raises(ConfigurationError):
             PluginConfig.from_mapping({"fetch": {"global_poll_interval": value}})
+
+
+@pytest.mark.parametrize(
+    ("value", "seconds"),
+    [("1d", 86400), ("2h", 7200), ("30m", 1800), ("45s", 45), ("300", 300), (" 2 H ", 7200)],
+)
+def test_global_interval_units_in_grouped_and_legacy_config(value, seconds):
+    for mapping in ({"fetch": {"global_poll_interval": value}}, {"global_poll_interval": value}):
+        assert PluginConfig.from_mapping(mapping).global_poll_interval == seconds
+        migrate_legacy_config(mapping)
+        assert PluginConfig.from_mapping(mapping).global_poll_interval == seconds
+        assert mapping["fetch"]["global_poll_interval"] == seconds
+
+
+@pytest.mark.parametrize("value", ["0d", "0h", "0m", "0s", "-1h", "1.5h", "1h30m", "1w", ""])
+def test_global_interval_rejects_zero_units_and_invalid_duration(value):
+    with pytest.raises(ConfigurationError, match="d/h/m/s"):
+        PluginConfig.from_mapping({"fetch": {"global_poll_interval": value}})
+
+
+def test_interval_units_keep_grouped_precedence_during_legacy_migration():
+    mapping = {"fetch": {"global_poll_interval": "2h"}, "global_poll_interval": "30m"}
+    assert PluginConfig.from_mapping(mapping).global_poll_interval == 7200
+    migrate_legacy_config(mapping)
+    assert mapping["fetch"]["global_poll_interval"] == 7200
+    assert mapping["global_poll_interval"] == 0
 
 
 def test_send_as_media_is_strict_boolean_and_defaults_on():

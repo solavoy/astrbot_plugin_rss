@@ -1,6 +1,6 @@
 [project]
 name = "astrbot-plugin-rss"
-version = "1.0.0"
+version = "1.1.0"
 requires-python = ">=3.12"
 dependencies = ["aiosqlite>=0.20", "beautifulsoup4>=4.12", "curl_cffi>=0.16.3,<0.17", "feedparser>=6.0", "Pillow>=10.0", "tzdata>=2024.1"]
 

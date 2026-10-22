@@ -81,10 +81,19 @@ def test_registered_web_handlers_route_to_real_services(tmp_path, monkeypatch):
         state._json = {"poll_interval": 0}
         inherited = await context.handlers[("POST", "/astrbot_plugin_rss/feeds/<feed_id>/update")]()
         assert inherited["kind"] == "json" and inherited["value"]["poll_interval"] is None
-        state._json = {"poll_interval": 1}
-        one_second = await context.handlers[("POST", "/astrbot_plugin_rss/feeds/<feed_id>/update")]()
-        assert one_second["kind"] == "json" and one_second["value"]["poll_interval"] == 1
-        for invalid in (-1, 1.5, True):
+        for interval, expected in (
+            (1, 1),
+            ("2d", 172800),
+            (" 3 H ", 10800),
+            ("4m", 240),
+            ("5s", 5),
+            ("6", 6),
+            ("0d", None),
+        ):
+            state._json = {"poll_interval": interval}
+            updated = await context.handlers[("POST", "/astrbot_plugin_rss/feeds/<feed_id>/update")]()
+            assert updated["kind"] == "json" and updated["value"]["poll_interval"] == expected
+        for invalid in (-1, 1.5, True, "-1h", "1.5d", "1h30m", "1w", ""):
             state._json = {"poll_interval": invalid}
             rejected = await context.handlers[("POST", "/astrbot_plugin_rss/feeds/<feed_id>/update")]()
             assert rejected["kind"] == "error" and rejected["status"] == 400
@@ -104,7 +113,7 @@ def test_registered_web_handlers_route_to_real_services(tmp_path, monkeypatch):
         missing = await context.handlers[("GET", "/astrbot_plugin_rss/feeds/<feed_id>")]()
         assert missing["kind"] == "error" and missing["status"] == 404
 
-        state._json = {"name": "Engineering", "poll_interval": 0}
+        state._json = {"name": "Engineering", "poll_interval": "3m"}
         created = await context.handlers[("POST", "/astrbot_plugin_rss/lists/create")]()
         assert created["kind"] == "json"
         list_id = created["value"]["list_id"]
@@ -113,13 +122,16 @@ def test_registered_web_handlers_route_to_real_services(tmp_path, monkeypatch):
             await runtime.database.fetchone(
                 "SELECT poll_interval FROM subscription_lists WHERE list_id=?", (list_row["list_id"],)
             )
-        )[0] is None
+        )[0] == 180
         state.path_params = {"list_id": list_id}
-        state._json = {"name": "Renamed", "poll_interval": 1}
+        state._json = {"name": "Renamed", "poll_interval": "2h"}
         updated = await context.handlers[("POST", "/astrbot_plugin_rss/lists/<list_id>/update")]()
         assert updated["kind"] == "json" and updated["value"]["list"]["name"] == "Renamed"
-        assert updated["value"]["list"]["poll_interval"] == 1
-        for invalid in (-1, 1.5, True):
+        assert updated["value"]["list"]["poll_interval"] == 7200
+        state._json = {"poll_interval": "0"}
+        inherited = await context.handlers[("POST", "/astrbot_plugin_rss/lists/<list_id>/update")]()
+        assert inherited["kind"] == "json" and inherited["value"]["list"]["poll_interval"] is None
+        for invalid in (-1, 1.5, True, "-1h", "1.5d", "1h30m", "1w", ""):
             state._json = {"poll_interval": invalid}
             rejected = await context.handlers[("POST", "/astrbot_plugin_rss/lists/<list_id>/update")]()
             assert rejected["kind"] == "error" and rejected["status"] == 400
@@ -130,6 +142,60 @@ def test_registered_web_handlers_route_to_real_services(tmp_path, monkeypatch):
         missing = await context.handlers[("POST", "/astrbot_plugin_rss/lists/<list_id>/delete")]()
         assert missing["kind"] == "error" and missing["status"] == 404
         await runtime.close()
+
+    asyncio.run(run())
+
+
+def test_feed_create_api_accepts_units_and_rejects_invalid_interval_before_fetch(tmp_path, monkeypatch):
+    import astrbot_plugin_rss.services.facade as facade_module
+    from astrbot_plugin_rss.core.models import FetchResult, ParsedFeed
+    from astrbot_plugin_rss.core.security import ValidatedURL
+
+    state = _install_astrbot_web(monkeypatch)
+    sys.modules.pop("astrbot_plugin_rss.web.api", None)
+    api_module = importlib.import_module("astrbot_plugin_rss.web.api")
+
+    async def allow_url(url):
+        return ValidatedURL(url, "example.org", 443, ())
+
+    monkeypatch.setattr(facade_module, "validate_public_url", allow_url)
+
+    class Fetcher:
+        calls = 0
+
+        async def fetch(self, feed, force=False):
+            self.calls += 1
+            return FetchResult(feed.feed_id, feed.url, status_code=200, raw_xml=b"<rss/>")
+
+    class Parser:
+        def parse(self, _result):
+            return ParsedFeed(title="Interval units")
+
+    async def run():
+        fetcher = Fetcher()
+        runtime = RSSRuntime({}, tmp_path, fetcher=fetcher, parser=Parser())
+        await runtime.initialize()
+        try:
+            api = api_module.WebAPI(runtime)
+            target = await runtime.repository.create_target("instance", "origin", "test", "session")
+            state._json = {"url": "https://example.org/created", "target_id": target.target_id, "poll_interval": "2h"}
+            created = await api.post("feeds/create", state)
+            assert created["kind"] == "json"
+            assert created["value"]["feed"]["poll_interval"] == 7200
+            assert fetcher.calls == 1
+
+            for invalid in (True, "-1h", "1.5d", "1h30m", "1w", ""):
+                state._json = {
+                    "url": "https://example.org/invalid",
+                    "target_id": target.target_id,
+                    "poll_interval": invalid,
+                }
+                rejected = await api.post("feeds/create", state)
+                assert rejected["kind"] == "error" and rejected["status"] == 400
+                assert fetcher.calls == 1
+            assert await runtime.repository.get_feed_by_url("https://example.org/invalid") is None
+        finally:
+            await runtime.close()
 
     asyncio.run(run())
 
