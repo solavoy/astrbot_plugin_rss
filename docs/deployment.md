@@ -1,0 +1,49 @@
+# Deployment and verification
+
+## Requirements
+
+Use AstrBot 4.29.0 or later, together with the Python runtime supported by that installation. The compatibility baseline is the official v4.29.0 tag: [`astrbot/api/web.py`](https://github.com/AstrBotDevs/AstrBot/blob/v4.29.0/astrbot/api/web.py) provides the web response API; [`dashboard/api/plugins.py`](https://github.com/AstrBotDevs/AstrBot/blob/v4.29.0/astrbot/dashboard/api/plugins.py) discovers plugin `views/` pages and serves the bridge; and [`core/star/context.py`](https://github.com/AstrBotDevs/AstrBot/blob/v4.29.0/astrbot/core/star/context.py) registers plugin Web APIs. Compatibility with earlier releases has not been validated. These source references establish the API baseline; behavior on the actual host and platform still requires verification in the deployment environment. Install the packages in `requirements.txt` into AstrBot's plugin environment:
+
+```sh
+python -m pip install -r requirements.txt
+```
+
+`curl_cffi` provides the normal HTTP fetcher, `feedparser` parses RSS/Atom/RDF, `beautifulsoup4` normalizes HTML, and `aiosqlite` stores subscriptions and deliveries. CloakBrowser is optional. Keep it disabled unless its Python package and a matching Chromium binary have been installed according to the package's official deployment instructions. Linux deployments may need the Chromium runtime libraries required by the selected browser build (for example the distribution's NSS, GTK, and font packages); package names differ by distribution. This plugin does not install browser binaries or system libraries.
+
+The optional Python package version exercised by the test environment was `cloakbrowser==0.6.2`; install it only when browser fallback is required. The browser binary is a separate deployment dependency. Confirm the package's current system-library instructions for the target Linux distribution before enabling it.
+
+## Install and start
+
+Place the repository under AstrBot's plugin directory, install requirements in the same environment as AstrBot, restart AstrBot, then enable `astrbot_plugin_rss`. The database and plugin state are created under AstrBot's managed plugin data directory. Enable the plugin's Plugin View in the AstrBot dashboard to open the management pages. The backend only registers authenticated routes under `/astrbot_plugin_rss/`; it does not open another HTTP listener.
+
+The Plugin View assets are already included in `views/rss`. The interface uses plain HTML/CSS/JavaScript and the locally vendored petite-vue 0.4.1 runtime, so plugin installation does not require Node.js, npm, an internet connection for frontend assets, or a build command.
+
+Use the dashboard's configured admin accounts for management. Group subscription commands allow any member by default; `general.group_admin_only=true` restricts those operations to users accepted by AstrBot's `event.is_admin()`. Private chats are not affected. A target becomes available only after a real event from that platform destination registers its routing information. Configure the bot's platform adapter and credentials in AstrBot itself; this plugin contains no platform tokens.
+
+## Configuration
+
+The plugin has seven configuration groups and 12 visible settings. `general.timezone` defaults to `Asia/Shanghai`; `general.group_admin_only` to `false`; `fetch.global_poll_interval` to 300 seconds (minimum 1); `fetch.request_timeout` to 15 seconds; `network.proxy`, both `rsshub` values, and `telegram.telegraph_access_token` to empty; `media.send_as_media` to `true`; `translation.provider_id` to empty; and `translation.include_original` to `true`. An empty provider disables AI calls. The multi-line `translation.prompt` is a system prompt beginning `你是一名专业的 RSS 内容翻译者。目标语言：[简体中文]。`; change the language in brackets or replace the prompt. `include_original` controls whether each translated unit is preceded by its source. The `timezone` setting accepts IANA names such as `Asia/Shanghai`, `UTC`, and `America/New_York`; the declared `tzdata` dependency supplies the database on systems without one.
+
+AI translation is controlled per Feed by `translation_enabled`, which defaults to `false` for new and upgraded Feeds. The plugin calls the configured translation provider only when this switch is enabled and `translation.provider_id` is set.
+
+When media sending is disabled, every channel renders original media URLs as links and skips plugin media downloads/uploads. When enabled, AstrBot message chains use official `Image`/`Video` URL components. Lark image-and-text articles use a card; if the article includes video, each video is sent as a separate `media` operation after its card. A pure video article uses AstrBot's default `Video.fromURL` URL component, which the adapter downloads and sends. Telegraph embeds the original HTTP(S) URL without downloading it. Images retain their original bytes, dimensions, and proportions. Generic component URLs receive a public HTTP(S) check before AstrBot's adapter handles transport; the plugin does not impose a file-size limit on that adapter request or pin its subsequent DNS resolution. The plugin's own Lark downloads pin validated DNS results and enforce the platform limits: 10 MB per image and 30 MB per video. Oversized media falls back to its source link.
+
+The RSSHub prefix applies to relative feed routes beginning with `/` and may point to RSSHub or an ordinary HTTP(S) service; the access key is added only to those relative requests. Complete HTTP(S) feed URLs remain unchanged. Feed and list interval inputs accept non-negative integers in seconds: `0` inherits the global interval and is stored as `NULL`; positive values down to 1 second are accepted. Boolean, fractional, and negative values are rejected. The scheduler checks every second so a 1-second configured interval is not held back by a longer fixed tick. The proxy is used for RSS feed fetching only; media downloads and Telegraph publishing use their existing transports.
+
+Entering a Telegraph token enables publishing Telegram articles to Telegraph; clearing it disables the feature. Feishu credentials are managed by AstrBot's platform adapter and need no plugin setting. Proxy URLs, RSSHub access keys, and Telegraph tokens are secret values.
+
+On first load, legacy flat `global_poll_interval`, `request_timeout`, `proxy`, and `telegraph_access_token` values migrate into the corresponding group, then normalize to non-overriding compatibility sentinels. A non-default grouped value wins over its legacy field. Hidden compatibility fields use non-null type defaults because AstrBot 4.29.1 converts null fields to zero values when saving. Invalid legacy values do not replace valid grouped values. Startup restores grouped zero intervals/timeouts left by the earlier migration to their defaults (300 seconds and 15 seconds); direct configuration parsing still rejects explicit zero or invalid grouped values. Migration saves only the plugin's `AstrBotConfig`. The obsolete configurable minimum interval is ignored; the global interval must be a positive integer and configured polling paths have a 1-second minimum.
+
+The schema retains four invisible legacy nodes because AstrBot removes unknown settings while loading a plugin. These nodes let the plugin receive old values before migration and do not appear in the settings form. Older configurations without the RSSHub group use empty prefix and access-key defaults.
+
+## Operations
+
+The SQLite database is `rss.sqlite3` under plugin data. Use the Plugin View backup endpoint for a consistent SQLite snapshot and keep the resulting file private. Business export excludes cookie files. Persistent browser sessions are separate site-scoped data and are not included in business exports. Restore validates schema version, integrity, foreign keys, and expected tables, makes a safety backup, stops old runtime tasks, swaps the database, and rebuilds runtime resources. Restore/import confirmations are short-lived, one-use, bound to the authenticated dashboard username and the selected file name and byte size.
+
+Delivery rows in `unknown` mean the platform send began but no definitive outcome was recorded. Check the destination before resolving an unknown delivery as sent or retrying it. The plugin does not silently retry unknown operations because that can duplicate a message. Cleanup retains pending, retryable failed, sending, and unknown work; older successes and terminal non-retryable failures can expire when no unprocessed path or batch refers to them.
+
+## Deployment acceptance checks
+
+After installing, enable the plugin in AstrBot and verify that it initializes, its data directory is writable, and `GET /astrbot_plugin_rss/dashboard` works from the authenticated Plugin View. Add a public feed, use the manual check, confirm normalized articles appear, then use preview before test-pushing to a registered target. Test a real platform send with a destination you control and verify delivery status in the UI. Confirm a backup can be downloaded and that a restore reports a safety backup.
+
+Automated tests use mocked network/browser/platform integrations. The `linux.do` Discourse fixture in `tests/fixtures/discourse_feedback.xml` is synthetic: this environment's direct request could not retrieve `https://linux.do/c/feedback/2.rss`, and the fixture must not be described as a captured copy of that live feed.

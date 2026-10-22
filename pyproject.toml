@@ -1,0 +1,21 @@
+[project]
+name = "astrbot-plugin-rss"
+version = "1.0.0"
+requires-python = ">=3.12"
+dependencies = ["aiosqlite>=0.20", "beautifulsoup4>=4.12", "curl_cffi>=0.16.3,<0.17", "feedparser>=6.0", "Pillow>=10.0", "tzdata>=2024.1"]
+
+[project.optional-dependencies]
+browser = ["cloakbrowser>=0.6.2,<0.7"]
+dev = ["pytest>=8", "pytest-asyncio>=0.24", "ruff>=0.9"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+ignore = ["E501"]

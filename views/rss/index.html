@@ -1,0 +1,1405 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light dark">
+    <title>
+      RSS 订阅中心
+    </title>
+    <link rel="stylesheet" href="./app.css">
+    <script src="./assets/petite-vue-0.4.1.iife.js"></script>
+    <script defer src="./app.js"></script>
+  </head>
+  <body>
+    <div id="app" v-scope="App()" @vue:mounted="start()">
+      <div v-if="error && !ready" class="bridge-error">
+        <div class="bridge-error-card">
+          <div class="brand-mark">
+            RSS
+          </div>
+          <p class="eyebrow">
+            AstrBot 插件管理界面
+          </p>
+          <h1>
+            无法连接管理面板
+          </h1>
+          <p>
+            {{ error }}
+          </p>
+        </div>
+      </div>
+      <div v-else class="app-shell">
+        <aside class="sidebar">
+          <div class="brand">
+            <div class="brand-mark">
+              ≈
+            </div>
+            <div>
+              <strong>
+                {{ title }}
+              </strong>
+              <span>
+                内容分发控制台
+              </span>
+            </div>
+          </div>
+          <div class="nav-label">
+            工作区
+          </div>
+          <nav class="side-nav" aria-label="主导航">
+            <a v-for="item in links" :href="item.href" class="nav-item" :class="{active: route === item.path}">
+              <span>
+                {{ item.icon }}
+              </span>
+              <span>
+                {{ item.label }}
+              </span>
+              <span v-if="route === item.path" class="nav-dot">
+              </span>
+            </a>
+          </nav>
+          <div class="sidebar-bottom">
+            <div class="connection">
+              <span class="online-dot">
+              </span>
+              已连接 AstrBot
+            </div>
+            <div class="sidebar-caption">
+              RSS 订阅 · 可靠推送
+            </div>
+          </div>
+        </aside>
+        <main class="main-area">
+          <header class="topbar">
+            <div class="breadcrumbs">
+              <span>
+                RSS 工作台
+              </span>
+              <i>
+                /
+              </i>
+              <strong>
+                {{ pageTitle }}
+              </strong>
+            </div>
+            <div class="topbar-right">
+              <span class="live-indicator">
+                ● 实时运行状态
+              </span>
+              <div class="avatar">
+                R
+              </div>
+            </div>
+          </header>
+          <div class="page-container">
+            <div v-if="error" class="alert error">
+              {{ error }}
+            </div>
+            <div v-if="notice" class="alert success">
+              {{ notice }}
+            </div>
+            <div v-if="loading" class="loading-card">
+              <span class="spinner">
+              </span>
+              正在读取数据…
+            </div>
+            <div v-if="!loading && route === '/'">
+              <section class="page-heading">
+                <div>
+                  <p class="eyebrow">
+                    OVERVIEW
+                  </p>
+                  <h1>
+                    订阅运行概览
+                  </h1>
+                  <p class="subheading">
+                    查看抓取健康、投递进度与最近更新。
+                  </p>
+                </div>
+                <div class="heading-actions">
+                  <button :disabled="busy" class="button secondary" @click="load">
+                    刷新
+                  </button>
+                  <button :disabled="busy" class="button secondary" @click="scheduler(data?.paused ? 'resume' : 'pause')">
+                    {{ data?.paused ? '恢复调度' : '暂停调度' }}
+                  </button>
+                  <button :disabled="busy" class="button primary" @click="scheduler('check')">
+                    立即检查
+                  </button>
+                </div>
+              </section>
+              <div v-if="data">
+                <div class="status-banner" :class="data.paused ? 'paused' : 'running'">
+                  <span class="status-icon">
+                    ●
+                  </span>
+                  <div>
+                    <strong>
+                      {{ data.paused ? '抓取调度已暂停' : '抓取调度正在运行' }}
+                    </strong>
+                    <span>
+                      近一小时完成 {{ n(data.fetch_stats?.last_hour) }} 次检查
+                    </span>
+                  </div>
+                  <a href="#/data" class="text-link">
+                    运行配置 →
+                  </a>
+                </div>
+                <div class="metric-grid">
+                  <article class="metric-card">
+                    <span>
+                      订阅源
+                    </span>
+                    <strong>
+                      {{ n(data.counts?.feeds) }}
+                    </strong>
+                    <small>
+                      {{ n(data.counts?.active_feeds) }} 个启用中
+                    </small>
+                  </article>
+                  <article class="metric-card">
+                    <span>
+                      待投递
+                    </span>
+                    <strong>
+                      {{ n(data.counts?.pending) }}
+                    </strong>
+                    <small>
+                      可靠队列中的任务
+                    </small>
+                  </article>
+                  <article class="metric-card">
+                    <span>
+                      今日成功
+                    </span>
+                    <strong>
+                      {{ n(data.counts?.today_success) }}
+                    </strong>
+                    <small>
+                      已确认的平台发送
+                    </small>
+                  </article>
+                  <article class="metric-card">
+                    <span>
+                      需关注
+                    </span>
+                    <strong>
+                      {{ n((data.counts?.feed_errors||0)+(data.counts?.failed||0)) }}
+                    </strong>
+                    <small>
+                      {{ n(data.counts?.feed_errors) }} 个源异常 · {{ n(data.counts?.failed) }} 条失败
+                    </small>
+                  </article>
+                </div>
+                <div class="dashboard-grid">
+                  <section class="panel">
+                    <div class="panel-heading">
+                      <div>
+                        <p class="eyebrow">
+                          RECENT ARTICLES
+                        </p>
+                        <h2>
+                          最近文章
+                        </h2>
+                      </div>
+                      <a href="#/feeds" class="text-link">
+                        查看订阅源 →
+                      </a>
+                    </div>
+                    <div v-if="!data.recent_articles?.length" class="empty-state">
+                      还没有新文章
+                    </div>
+                    <div v-else class="article-list">
+                      <a v-for="item in data.recent_articles" :href="safeUrl(item.canonical_url)" target="_blank" rel="noopener noreferrer" class="article-row">
+                        <div class="article-dot">
+                        </div>
+                        <div class="article-copy">
+                          <strong>
+                            {{ txt(item.title) }}
+                          </strong>
+                          <span>
+                            {{ txt(item.feed_title || (item.feed_public_id ? '源 '+item.feed_public_id : '订阅源')) }}
+                          </span>
+                        </div>
+                        <time>
+                          {{ articleDate(item) }}
+                        </time>
+                        →
+                      </a>
+                    </div>
+                  </section>
+                  <section class="panel">
+                    <div class="panel-heading">
+                      <div>
+                        <p class="eyebrow">
+                          ATTENTION
+                        </p>
+                        <h2>
+                          最近异常
+                        </h2>
+                      </div>
+                      <a href="#/feeds" class="text-link">
+                        管理源 →
+                      </a>
+                    </div>
+                    <div v-if="!data.recent_errors?.length" class="empty-state compact">
+                      暂无抓取异常
+                    </div>
+                    <div v-for="issue in data.recent_errors" class="issue-row">
+                      <span class="issue-mark">
+                        !
+                      </span>
+                      <div>
+                        <strong>
+                          {{txt(issue.url||(issue.feed_public_id?'源 '+issue.feed_public_id:'订阅源'))}}
+                        </strong>
+                        <p>
+                          {{txt(issue.error_message||issue.error_type)}}
+                        </p>
+                        <time>
+                          {{date(issue.fetched_at)}}
+                        </time>
+                      </div>
+                    </div>
+                  </section>
+                </div>
+                <section class="fetch-summary">
+                  <div>
+                    <p class="eyebrow">
+                      FETCH ACTIVITY
+                    </p>
+                    <strong>
+                      抓取统计
+                    </strong>
+                  </div>
+                  <div class="summary-stat">
+                    <span>
+                      近一小时
+                    </span>
+                    <b>
+                      {{n(data.fetch_stats?.last_hour)}}
+                    </b>
+                  </div>
+                  <div class="summary-stat">
+                    <span>
+                      成功率
+                    </span>
+                    <b>
+                      {{Number(data.fetch_stats?.success_rate||0).toLocaleString('zh-CN',{style:'percent',maximumFractionDigits:1})}}
+                    </b>
+                  </div>
+                  <div class="summary-stat">
+                    <span>
+                      curl 成功率
+                    </span>
+                    <b>
+                      {{Number(data.fetch_stats?.curl_success_rate||0).toLocaleString('zh-CN',{style:'percent',maximumFractionDigits:1})}}
+                    </b>
+                  </div>
+                  <div class="summary-stat">
+                    <span>
+                      浏览器尝试 / 回退
+                    </span>
+                    <b>
+                      {{n(data.fetch_stats?.browser_attempts)}} / {{n(data.fetch_stats?.browser_fallbacks)}}
+                    </b>
+                  </div>
+                  <div class="summary-stat">
+                    <span>
+                      Cookie 命中 / 缓存命中
+                    </span>
+                    <b>
+                      {{n(data.fetch_stats?.cookie_hits)}} / {{n(data.fetch_stats?.cookie_cache_hits)}}
+                    </b>
+                  </div>
+                  <div class="summary-stat">
+                    <span>
+                      失败
+                    </span>
+                    <b>
+                      {{n(data.fetch_stats?.failures)}}
+                    </b>
+                  </div>
+                  <div class="summary-stat">
+                    <span>
+                      列表 / 目标
+                    </span>
+                    <b>
+                      {{n(data.counts?.lists)}} / {{n(data.counts?.targets)}}
+                    </b>
+                  </div>
+                </section>
+              </div>
+            </div>
+            <div v-if="!loading && route === '/feeds'">
+              <section class="page-heading">
+                <div>
+                  <p class="eyebrow">
+                    SOURCES
+                  </p>
+                  <h1>
+                    订阅源
+                  </h1>
+                  <p class="subheading">
+                    管理共享 RSS 源，并查看通过直接订阅或列表分发的渠道。
+                  </p>
+                </div>
+                <button :disabled="busy" class="button secondary" @click="scope=scope==='direct'?'all':'direct';load()">
+                  {{scope==='all'?'只看直接订阅':'查看所有订阅源'}}
+                </button>
+              </section>
+              <section class="panel create-panel">
+                <div class="panel-heading">
+                  <div>
+                    <p class="eyebrow">
+                      NEW SUBSCRIPTION
+                    </p>
+                    <h2>
+                      添加 RSS 源
+                    </h2>
+                  </div>
+                  <span class="soft-badge">
+                    公开地址校验
+                  </span>
+                </div>
+                <div class="form-row">
+                  <label class="field grow">
+                    <span>
+                      公开地址或 RSSHub 路径
+                    </span>
+                    <input v-model="createUrl" type="text" placeholder="https://example.com/feed.xml 或 /twitter/user">
+                  </label>
+                  <label class="field target-field">
+                    <span>
+                      订阅目标
+                    </span>
+                    <select v-model="targetId">
+                      <option value="">
+                        选择已登记目标
+                      </option>
+                      <option v-for="t in targets" :value="t.target_id">
+                        {{t.label||t.target_id}} · {{t.platform}}
+                      </option>
+                    </select>
+                  </label>
+                  <button :disabled="busy" class="button primary" @click="createFeed">
+                    添加并订阅
+                  </button>
+                </div>
+                <label class="toggle-row">
+                  <span>
+                    AI 翻译
+                    <small>使用插件中配置的翻译模型</small>
+                  </span>
+                  <input type="checkbox" v-model="createTranslationEnabled">
+                </label>
+              </section>
+              <section class="panel table-panel">
+                <div class="panel-heading">
+                  <div>
+                    <p class="eyebrow">
+                      YOUR SOURCES
+                    </p>
+                    <h2>
+                      订阅源
+                      <span class="count-pill">
+                        {{feeds.total||0}}
+                      </span>
+                    </h2>
+                  </div>
+                  <button :disabled="busy" class="icon-button" @click="load">
+                    ↻
+                  </button>
+                </div>
+                <div class="toolbar">
+                  <input class="search-input" v-model="query" placeholder="搜索标题或 URL" @keyup.enter="pageNo=1;load()">
+                  <span class="result-count">
+                    显示 {{feeds.items?.length||0}} 条
+                  </span>
+                </div>
+                <div v-if="!feeds.items?.length" class="empty-state">
+                  还没有匹配的订阅源
+                </div>
+                <div v-else class="table-wrap">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>编号</th>
+                        <th>
+                          订阅源
+                        </th>
+                        <th>
+                          状态
+                        </th>
+                        <th>
+                          翻译
+                        </th>
+                        <th>
+                          检查周期
+                        </th>
+                        <th>
+                          最近检查
+                        </th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <tr v-for="f in feeds.items" class="click-row" @click="openFeed(f)">
+                        <td><code>{{entityPublicId(f)}}</code></td>
+                        <td>
+                          <strong>
+                            {{f.title||f.url}}
+                          </strong>
+                          <small>
+                            {{f.url}}
+                          </small>
+                        </td>
+                        <td>
+                          {{f.enabled?'启用':'已暂停'}}
+                        </td>
+                        <td>
+                          {{f.translation_enabled?'开启':'关闭'}}
+                        </td>
+                        <td>
+                          {{f.poll_interval?f.poll_interval+'s':'继承全局'}}
+                        </td>
+                        <td>
+                          {{date(f.last_fetch_at)}}
+                        </td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+                <div class="pagination">
+                  <span>
+                    第 {{feeds.page||pageNo}} 页 · 共 {{feeds.total||0}} 条
+                  </span>
+                  <div>
+                    <button class="button tiny secondary" :disabled="pageNo<=1" @click="pageNo--;load()">
+                      上一页
+                    </button>
+                    <button class="button tiny secondary" :disabled="pageNo*20>=(feeds.total||0)" @click="pageNo++;load()">
+                      下一页
+                    </button>
+                  </div>
+                </div>
+              </section>
+            </div>
+            <div v-if="!loading && route.startsWith('/feeds/') && detail?.feed">
+              <section class="page-heading">
+                <div>
+                  <button :disabled="busy" class="back-link" @click="go('/feeds')">
+                    ← 返回订阅源
+                  </button>
+                  <p class="eyebrow">
+                    FEED DETAIL
+                  </p>
+                  <h1>
+                    {{detail?.feed?.title||detail?.feed?.url}}
+                  </h1>
+                  <p class="subheading url-line">
+                    {{detail?.feed?.url}}
+                  </p>
+                  <p class="entity-public-id">编号 <code>{{entityPublicId(detail?.feed)}}</code></p>
+                  <p class="feed-description">
+                    {{detail?.feed?.description}}
+                  </p>
+                </div>
+                <div class="heading-actions">
+                  <button :disabled="busy" class="button secondary" @click="feedAction('preview')">
+                    预览
+                  </button>
+                  <button :disabled="busy" class="button secondary" @click="feedAction('refresh')">
+                    立即检查
+                  </button>
+                </div>
+              </section>
+              <div class="detail-grid">
+                <section class="panel detail-main">
+                  <div class="detail-tabs" role="tablist" aria-label="订阅源详情">
+                    <button class="detail-tab" :class="{active:detailTab==='subscribers'}" role="tab" :aria-selected="detailTab==='subscribers'" @click="detailTab='subscribers'">订阅渠道</button>
+                    <button class="detail-tab" :class="{active:detailTab==='articles'}" role="tab" :aria-selected="detailTab==='articles'" @click="detailTab='articles'">最新文章</button>
+                    <button class="detail-tab" :class="{active:detailTab==='fetch_logs'}" role="tab" :aria-selected="detailTab==='fetch_logs'" @click="detailTab='fetch_logs'">抓取日志</button>
+                  </div>
+                  <div v-if="detailTab==='subscribers'">
+                    <h2>订阅渠道 · {{feedSubscribers().length}}</h2>
+                    <div v-if="!feedSubscribers().length" class="empty-state compact">当前没有订阅渠道</div>
+                    <div v-for="s in feedSubscribers()" class="subscriber-row">
+                      <div>
+                        <strong>{{subscriberTitle(s)}}</strong>
+                        <small>{{subscriberPlatform(s)}} · {{s.enabled===false?'已停用':'启用'}}</small>
+                        <small v-if="subscriberHasOrigin(s)">{{s.unified_origin}}</small>
+                        <small v-for="path in subscriberPaths(s)">{{path}}</small>
+                      </div>
+                    </div>
+                  </div>
+                  <div v-if="detailTab==='articles'">
+                    <h2>最新文章 · {{detail?.articles?.length||0}}</h2>
+                    <div v-if="!detail?.articles?.length" class="empty-state compact">尚无文章</div>
+                    <div v-for="a in (detail?.articles||[])" class="article-row">
+                      <div class="article-dot"></div>
+                      <div class="article-copy">
+                        <a :href="safeUrl(a.canonical_url)" target="_blank" rel="noopener noreferrer"><strong>{{a.title||'文章'}}</strong></a>
+                        <span>{{articleDate(a)}}</span>
+                      </div>
+                    </div>
+                  </div>
+                  <div v-if="detailTab==='fetch_logs'">
+                    <h2>抓取日志 · {{detail?.fetch_logs?.length||0}}</h2>
+                    <div v-if="!detail?.fetch_logs?.length" class="empty-state compact">暂无抓取记录</div>
+                    <div v-for="log in (detail?.fetch_logs||[])" class="log-row">
+                      <span>{{log.error_type||'成功'}}</span>
+                      <span>{{date(log.fetched_at)}}</span>
+                      <small>{{log.error_message||log.status_code||''}}</small>
+                    </div>
+                  </div>
+                </section>
+                <aside class="detail-side">
+                  <section class="panel">
+                    <h2>
+                      订阅设置
+                    </h2>
+                    <label class="toggle-row">
+                      <span>
+                        启用抓取
+                      </span>
+                      <input type="checkbox" v-model="feedEnabled">
+                    </label>
+                    <label class="field">
+                      <span>
+                        抓取间隔
+                      </span>
+                      <input type="number" min="0" step="1" v-model="feedInterval">
+                      <small class="field-hint">0 表示继承全局，单位秒</small>
+                    </label>
+                    <label class="toggle-row">
+                      <span>
+                        AI 翻译
+                        <small>使用插件中配置的翻译模型</small>
+                      </span>
+                      <input type="checkbox" v-model="feedTranslationEnabled">
+                    </label>
+                    <button :disabled="busy" class="button primary full" @click="saveFeed">
+                      保存设置
+                    </button>
+                    <hr>
+                    <label class="field">
+                      <span>
+                        选择订阅目标
+                      </span>
+                      <select v-model="targetId">
+                        <option value="">
+                          选择已登记目标
+                        </option>
+                        <option v-for="t in targets" :value="t.target_id">
+                          {{t.label||t.target_id}}
+                        </option>
+                      </select>
+                    </label>
+                    <div class="stack-actions">
+                      <button :disabled="busy" class="button secondary full" @click="feedAction('test')">
+                        测试推送
+                      </button>
+                      <button :disabled="busy" class="button danger-outline full" @click="unsubscribe">
+                        取消该目标订阅
+                      </button>
+                    </div>
+                  </section>
+                  <section class="panel">
+                    <h2>
+                      访问会话
+                    </h2>
+                    <p class="session-status">
+                      {{hasSession()?JSON.stringify(detail?.cookie_status):'当前没有持久化会话信息。'}}
+                    </p>
+                    <div v-if="hasSession()" class="stack-actions">
+                      <button :disabled="busy" class="button secondary full" @click="sessionAction(detail?.cookie_status,'refresh')">
+                        刷新会话
+                      </button>
+                      <button :disabled="busy" class="button danger-outline full" @click="sessionAction(detail?.cookie_status,'clear')">
+                        清理 Cookie 与会话
+                      </button>
+                    </div>
+                  </section>
+                </aside>
+              </div>
+            </div>
+            <div v-if="!loading && route === '/lists'">
+              <section class="page-heading">
+                <div>
+                  <p class="eyebrow">
+                    COLLECTIONS
+                  </p>
+                  <h1>
+                    订阅列表
+                  </h1>
+                  <p class="subheading">
+                    把多个 Feed 汇总到列表，再分配给会话。
+                  </p>
+                </div>
+                <button :disabled="busy" class="button secondary" @click="load">
+                  刷新
+                </button>
+              </section>
+              <section class="panel create-panel">
+                <h2>
+                  创建订阅列表
+                </h2>
+                <div class="form-grid">
+                  <label class="field">
+                    <span>
+                      列表名称
+                    </span>
+                    <input v-model="listName" maxlength="120">
+                  </label>
+                  <label class="field">
+                      <span>检查周期（秒）</span>
+                      <input type="number" min="0" step="1" v-model="listInterval">
+                      <small class="field-hint">0 表示继承全局，单位秒</small>
+                  </label>
+                  <label class="field full-span">
+                    <span>
+                      描述（可选）
+                    </span>
+                    <input v-model="listDescription" maxlength="500">
+                  </label>
+                </div>
+                <div class="form-actions">
+                  <button :disabled="busy" class="button primary" @click="createList">
+                    创建列表
+                  </button>
+                </div>
+              </section>
+              <section class="panel">
+                <h2>
+                  列表
+                </h2>
+                <div class="toolbar">
+                  <input v-model="query" placeholder="搜索列表名称" @keyup.enter="pageNo=1;load()">
+                </div>
+                <div v-if="!lists.items?.length" class="empty-state">
+                  还没有订阅列表
+                </div>
+                <div v-else class="table-wrap">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>编号</th>
+                        <th>
+                          列表
+                        </th>
+                        <th>
+                          状态
+                        </th>
+                        <th>
+                          周期
+                        </th>
+                        <th>
+                          成员
+                        </th>
+                        <th>
+                          目标
+                        </th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <tr v-for="l in lists.items" class="click-row" @click="openList(l)">
+                        <td><code>{{entityPublicId(l)}}</code></td>
+                        <td>
+                          <strong>
+                            {{l.name}}
+                          </strong>
+                          <small>{{l.description||'订阅列表'}}</small>
+                        </td>
+                        <td>
+                          {{l.enabled?'启用':'暂停'}}
+                        </td>
+                        <td>
+                          {{l.poll_interval?l.poll_interval+'s':'继承全局'}}
+                        </td>
+                        <td>
+                          {{l.member_count||0}}
+                        </td>
+                        <td>
+                          {{l.subscriber_count||0}}
+                        </td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+                <div class="pagination">
+                  <span>
+                    第 {{lists.page||pageNo}} 页 · 共 {{lists.total||0}} 条
+                  </span>
+                  <div>
+                    <button class="button tiny secondary" :disabled="pageNo<=1" @click="pageNo--;load()">
+                      上一页
+                    </button>
+                    <button class="button tiny secondary" :disabled="pageNo*20>=(lists.total||0)" @click="pageNo++;load()">
+                      下一页
+                    </button>
+                  </div>
+                </div>
+              </section>
+            </div>
+            <div v-if="!loading && route.startsWith('/lists/') && detail?.list">
+              <section class="page-heading">
+                <div>
+                  <button :disabled="busy" class="back-link" @click="go('/lists')">
+                    ← 返回订阅列表
+                  </button>
+                  <p class="eyebrow">
+                    LIST DETAIL
+                  </p>
+                  <h1>
+                    {{detail?.list?.name}}
+                  </h1>
+                  <p class="entity-public-id">编号 <code>{{entityPublicId(detail?.list)}}</code></p>
+                  <p class="subheading">
+                    {{detail?.list?.description}}
+                  </p>
+                </div>
+                <div class="heading-actions">
+                  <button :disabled="busy" class="button secondary" @click="listPreview">
+                    预览汇总
+                  </button>
+                  <button :disabled="busy" class="button danger-button" @click="deleteList">
+                    删除列表
+                  </button>
+                </div>
+              </section>
+              <div class="detail-grid">
+                <div class="detail-main-stack">
+                  <section class="panel">
+                    <h2>
+                      列表设置
+                    </h2>
+                    <div class="form-grid">
+                      <label class="field">
+                        <span>
+                          名称
+                        </span>
+                        <input v-model="editListName" maxlength="120">
+                      </label>
+                      <label class="field">
+                        <span>检查周期（秒）</span>
+                        <input type="number" min="0" step="1" v-model="editListInterval">
+                        <small class="field-hint">0 表示继承全局，单位秒</small>
+                      </label>
+                      <label class="field full-span">
+                        <span>
+                          描述
+                        </span>
+                        <input v-model="editListDescription" maxlength="500">
+                      </label>
+                    </div>
+                    <div class="form-actions">
+                      <label class="toggle-row">
+                        <span>
+                          启用列表
+                        </span>
+                        <input type="checkbox" v-model="editListEnabled">
+                      </label>
+                      <button :disabled="busy" class="button primary" @click="saveList">
+                        保存设置
+                      </button>
+                    </div>
+                  </section>
+                  <section class="panel">
+                    <div class="detail-tabs" role="tablist" aria-label="订阅列表详情">
+                      <button class="detail-tab" :class="{active:detailTab==='subscribers'}" role="tab" :aria-selected="detailTab==='subscribers'" @click="detailTab='subscribers'">订阅渠道</button>
+                      <button class="detail-tab" :class="{active:detailTab==='articles'}" role="tab" :aria-selected="detailTab==='articles'" @click="detailTab='articles'">最新文章</button>
+                      <button class="detail-tab" :class="{active:detailTab==='fetch_logs'}" role="tab" :aria-selected="detailTab==='fetch_logs'" @click="detailTab='fetch_logs'">抓取日志</button>
+                      <button class="detail-tab" :class="{active:detailTab==='members'}" role="tab" :aria-selected="detailTab==='members'" @click="detailTab='members'">成员管理</button>
+                    </div>
+                    <div v-if="detailTab==='subscribers'">
+                      <h2>订阅渠道 · {{detail?.subscribers?.length||0}}</h2>
+                      <div v-if="!detail?.subscribers?.length" class="empty-state compact">当前没有订阅渠道</div>
+                      <div v-for="s in (detail?.subscribers||[])" class="subscriber-row">
+                        <div>
+                          <strong>{{subscriberTitle(s)}}</strong>
+                          <small>{{subscriberPlatform(s)}} · {{s.enabled===false?'已停用':'启用'}}</small>
+                          <small v-if="subscriberHasOrigin(s)">{{s.unified_origin}}</small>
+                          <small v-for="path in subscriberPaths(s)">{{path}}</small>
+                        </div>
+                      </div>
+                    </div>
+                    <div v-if="detailTab==='articles'">
+                      <h2>最新文章 · {{detail?.articles?.length||0}}</h2>
+                      <div v-if="!detail?.articles?.length" class="empty-state compact">尚无文章</div>
+                      <div v-for="a in (detail?.articles||[])" class="article-row">
+                        <div class="article-dot"></div>
+                        <div class="article-copy">
+                          <a :href="safeUrl(a.canonical_url)" target="_blank" rel="noopener noreferrer"><strong>{{a.title||'文章'}}</strong></a>
+                          <span>{{articleSource(a)}} {{articleDate(a)}}</span>
+                        </div>
+                      </div>
+                    </div>
+                    <div v-if="detailTab==='fetch_logs'">
+                      <h2>抓取日志 · {{detail?.fetch_logs?.length||0}}</h2>
+                      <div v-if="!detail?.fetch_logs?.length" class="empty-state compact">暂无抓取记录</div>
+                      <div v-for="log in (detail?.fetch_logs||[])" class="log-row">
+                        <span>{{log.feed_title||('源 '+(log.feed_public_id||'—'))}}</span>
+                        <span>{{log.error_type||'成功'}} · {{date(log.fetched_at)}}</span>
+                        <small>{{log.error_message||log.status_code||''}}</small>
+                      </div>
+                    </div>
+                    <div v-if="detailTab==='members'">
+                      <h2>成员 Feed · {{detail?.members?.length||0}}</h2>
+                      <div v-for="m in (detail?.members||[])" class="log-row">
+                        <span>{{m.title||m.url||'订阅源'}} <code>编号 {{entityPublicId(m)}}</code></span>
+                        <small>{{m.url||m.status||''}}</small>
+                        <button :disabled="busy||!m.feed_public_id" class="button tiny secondary" @click="removeMember(m.feed_public_id)">移除</button>
+                      </div>
+                      <div class="member-add">
+                        <label class="field">
+                          <span>已有订阅源（数字编号）</span>
+                          <select v-model="selectedFeed">
+                            <option value="">选择订阅源</option>
+                            <option v-for="f in feedChoices" :value="f.public_id">{{f.title||f.url}} · {{entityPublicId(f)}}</option>
+                          </select>
+                        </label>
+                        <button :disabled="busy" class="button secondary" @click="addMember(selectedFeed)">添加选择项</button>
+                      </div>
+                      <label class="field batch-field">
+                        <span>批量添加：每行订阅源数字编号、公开 URL 或 RSSHub 相对路径</span>
+                        <textarea v-model="addValue" rows="3"></textarea>
+                      </label>
+                      <button :disabled="busy" class="button secondary" @click="addMany">批量添加</button>
+                    </div>
+                  </section>
+                </div>
+                <aside class="detail-side">
+                  <section class="panel">
+                    <h2>
+                      订阅目标
+                    </h2>
+                    <label class="field">
+                      <span>
+                        已登记会话
+                      </span>
+                      <select v-model="targetId">
+                        <option value="">
+                          选择目标
+                        </option>
+                        <option v-for="t in targets" :value="t.target_id">
+                          {{t.label||t.target_id}} · {{t.platform}}
+                        </option>
+                      </select>
+                    </label>
+                    <div class="stack-actions">
+                      <button :disabled="busy" class="button primary full" @click="listSubscription('subscribe')">
+                        订阅列表
+                      </button>
+                      <button :disabled="busy" class="button secondary full" @click="listSubscription('unsubscribe')">
+                        取消列表订阅
+                      </button>
+                      <button :disabled="busy" class="button secondary full" @click="listPreview">
+                        预览列表消息
+                      </button>
+                    </div>
+                  </section>
+                </aside>
+              </div>
+            </div>
+            <div v-if="!loading && route === '/deliveries'">
+              <section class="page-heading">
+                <div>
+                  <p class="eyebrow">
+                    DELIVERY HISTORY
+                  </p>
+                  <h1>
+                    消息记录
+                  </h1>
+                  <p class="subheading">
+                    按状态与目标查找每次投递。
+                  </p>
+                </div>
+                <button :disabled="busy" class="button secondary" @click="load">
+                  刷新
+                </button>
+              </section>
+              <section class="panel">
+                <div class="filters-grid">
+                  <label class="field">
+                    <span>
+                      状态
+                    </span>
+                    <select v-model="deliveryStatus">
+                      <option value="">
+                        全部
+                      </option>
+                      <option value="success">
+                        成功
+                      </option>
+                      <option value="failed">
+                        失败
+                      </option>
+                      <option value="unknown">
+                        结果未知
+                      </option>
+                      <option value="pending">
+                        待投递
+                      </option>
+                    </select>
+                  </label>
+                  <label class="field">
+                    <span>
+                      平台
+                    </span>
+                    <input v-model="deliveryFilters.platform">
+                  </label>
+                  <label class="field">
+                    <span>
+                      订阅源编号
+                    </span>
+                    <input v-model="deliveryFilters.feed_id" type="number" min="1" step="1" placeholder="正整数">
+                  </label>
+                  <label class="field">
+                    <span>
+                      列表编号
+                    </span>
+                    <input v-model="deliveryFilters.list_id" type="number" min="1" step="1" placeholder="正整数">
+                  </label>
+                  <label class="field">
+                    <span>
+                      目标 ID
+                    </span>
+                    <input v-model="deliveryFilters.target_id">
+                  </label>
+                  <label class="field">
+                    <span>
+                      起始日期
+                    </span>
+                    <input type="date" v-model="deliveryFilters.date_from">
+                  </label>
+                  <label class="field">
+                    <span>
+                      结束日期
+                    </span>
+                    <input type="date" v-model="deliveryFilters.date_to">
+                  </label>
+                  <button :disabled="busy" class="button primary filter-button" @click="pageNo=1;load()">
+                    应用筛选
+                  </button>
+                </div>
+                <div v-if="!deliveries.items?.length" class="empty-state">
+                  没有符合条件的投递记录
+                </div>
+                <div v-else class="table-wrap">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>
+                          文章
+                        </th>
+                        <th>
+                          Feed
+                        </th>
+                        <th>
+                          目标
+                        </th>
+                        <th>
+                          状态
+                        </th>
+                        <th>
+                          时间
+                        </th>
+                        <th>
+                        </th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <tr v-for="d in deliveries.items" class="click-row" @click="go('/deliveries/'+encodeURIComponent(d.delivery_id))">
+                        <td>
+                          {{d.title||d.delivery_id}}
+                        </td>
+                        <td>
+                          {{d.feed_title||(d.feed_public_id?'源 '+d.feed_public_id:'订阅源')}}
+                        </td>
+                        <td>
+                          {{d.target_label||d.target_id}}
+                        </td>
+                        <td>
+                          {{d.status}}
+                        </td>
+                        <td>
+                          {{date(d.created_at)}}
+                        </td>
+                        <td>
+                          <button :disabled="busy" v-if="d.status==='failed' && d.retryable" class="button tiny secondary" @click.stop="retry(d.delivery_id)">
+                            重试
+                          </button>
+                        </td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+                <div class="pagination">
+                  <span>
+                    第 {{deliveries.page||pageNo}} 页 · 共 {{deliveries.total||0}} 条
+                  </span>
+                  <div>
+                    <button class="button tiny secondary" :disabled="pageNo<=1" @click="pageNo--;load()">
+                      上一页
+                    </button>
+                    <button class="button tiny secondary" :disabled="pageNo*20>=(deliveries.total||0)" @click="pageNo++;load()">
+                      下一页
+                    </button>
+                  </div>
+                </div>
+              </section>
+            </div>
+            <div v-if="!loading && route.startsWith('/deliveries/') && detail?.delivery">
+              <button :disabled="busy" class="back-link" @click="go('/deliveries')">
+                ← 返回消息记录
+              </button>
+              <div class="detail-grid">
+                <div class="detail-main-stack">
+                  <section class="panel">
+                    <p class="eyebrow">
+                      DELIVERY
+                    </p>
+                    <h2>
+                      {{detail?.article?.title||detail?.delivery?.title||detail?.delivery?.delivery_id}}
+                    </h2>
+                    <div class="data-rows">
+                      <div>
+                        <span>
+                          状态
+                        </span>
+                        <strong>
+                          {{detail?.delivery?.status}}
+                        </strong>
+                      </div>
+                      <div>
+                        <span>
+                          平台
+                        </span>
+                        <strong>
+                          {{detail?.delivery?.platform}}
+                        </strong>
+                      </div>
+                      <div>
+                        <span>
+                          目标
+                        </span>
+                        <strong>
+                          {{detail?.delivery?.target_id}}
+                        </strong>
+                      </div>
+                      <div>
+                        <span>
+                          来源路径
+                        </span>
+                        <strong>
+                          {{displaySourcePath(detail?.delivery?.source_path)}}
+                        </strong>
+                      </div>
+                      <div>
+                        <span>
+                          尝试次数
+                        </span>
+                        <strong>
+                          {{detail?.delivery?.attempts}}
+                        </strong>
+                      </div>
+                      <div>
+                        <span>
+                          平台消息 ID
+                        </span>
+                        <strong>
+                          {{detail?.delivery?.platform_message_id||'—'}}
+                        </strong>
+                      </div>
+                      <div>
+                        <span>
+                          是否可重试
+                        </span>
+                        <strong>
+                          {{detail?.delivery?.retryable?'是':'否'}}
+                        </strong>
+                      </div>
+                    </div>
+                    <button :disabled="busy" v-if="detail?.delivery?.status==='failed' && detail?.delivery?.retryable" class="button primary" @click="retry(detail?.delivery?.delivery_id)">
+                      重试失败投递
+                    </button>
+                    <button :disabled="busy" v-if="detail?.delivery?.status==='unknown'" class="button secondary" @click="resolve(detail?.delivery?.delivery_id,'delivered')">
+                      确认已送达
+                    </button>
+                    <button :disabled="busy" v-if="detail?.delivery?.status==='unknown'" class="button secondary" @click="resolve(detail?.delivery?.delivery_id,'retry')">
+                      核对后重试
+                    </button>
+                  </section>
+                  <section class="panel">
+                    <h2>
+                      尝试记录
+                    </h2>
+                    <div v-for="a in (detail?.attempts||[])" class="timeline-item">
+                      {{a.result}} · {{date(a.attempted_at)}}
+                      <small>
+                        {{a.platform_message_id||a.error||''}}
+                      </small>
+                    </div>
+                  </section>
+                </div>
+                <aside class="detail-side">
+                  <section class="panel">
+                    <h2>
+                      消息卡片
+                    </h2>
+                    <div v-for="(b,i) in (detail?.batches||[])" class="status-line">
+                      <span>
+                        卡片 {{Number(b.card_index||0)+1}} / {{b.card_count}}
+                      </span>
+                      <strong>
+                        {{b.status}} · {{b.payload?.renderer||'未知渲染器'}} / {{b.payload?.message_type||'未知类型'}}
+                      </strong>
+                    </div>
+                    <div v-for="(b,i) in (detail?.batches||[])" class="panel-subsection">
+                      <h3>
+                        卡片 {{Number(b.card_index||0)+1}} 的文章映射
+                      </h3>
+                      <div v-for="aid in b.article_ids" class="status-line">
+                        <span>
+                          {{aid}}
+                        </span>
+                        <strong>
+                          {{aid===detail?.delivery?.article_id?'当前文章':'同卡文章'}}
+                        </strong>
+                      </div>
+                    </div>
+                  </section>
+                </aside>
+              </div>
+            </div>
+            <div v-if="!loading && route === '/data'">
+              <section class="page-heading">
+                <div>
+                  <p class="eyebrow">
+                    SYSTEM
+                    &
+                    DATA
+                  </p>
+                  <h1>
+                    数据管理
+                  </h1>
+                  <p class="subheading">
+                    查看运行状态，导出业务数据或备份，并在确认后清理缓存。
+                  </p>
+                </div>
+                <button :disabled="busy" class="button secondary" @click="load">
+                  刷新状态
+                </button>
+              </section>
+              <div v-if="status">
+                <div class="data-card-grid">
+                  <section class="panel">
+                    <h2>
+                      数据库状态
+                    </h2>
+                    <div class="data-rows">
+                      <div>
+                        <span>
+                          文件大小
+                        </span>
+                        <strong>
+                          {{bytes(status.database.size_bytes)}}
+                        </strong>
+                      </div>
+                      <div>
+                        <span>
+                          Schema 版本
+                        </span>
+                        <strong>
+                          {{status.database.user_version}}
+                        </strong>
+                      </div>
+                      <div>
+                        <span>
+                          文件路径
+                        </span>
+                        <strong class="wrap-cell">
+                          {{status.database.path}}
+                        </strong>
+                      </div>
+                    </div>
+                    <div class="stack-actions">
+                      <button :disabled="busy" class="button secondary full" @click="download('data/export','rss-export.json')">
+                        导出订阅数据
+                      </button>
+                      <button :disabled="busy" class="button secondary full" @click="download('data/backup','rss-backup.sqlite3')">
+                        下载数据库备份
+                      </button>
+                    </div>
+                  </section>
+                  <section class="panel">
+                    <h2>
+                      调度状态
+                    </h2>
+                    <div class="data-rows">
+                      <div>
+                        <span>
+                          运行状态
+                        </span>
+                        <strong>
+                          {{status.scheduler.paused?'已暂停':'运行中'}}
+                        </strong>
+                      </div>
+                      <div>
+                        <span>
+                          浏览器兼容性
+                        </span>
+                        <strong>
+                          {{status.browser_compatibility?.status||'未提供'}}
+                        </strong>
+                      </div>
+                    </div>
+                  </section>
+                </div>
+                <div class="data-card-grid">
+                  <section class="panel">
+                    <h2>
+                      清理数据
+                    </h2>
+                    <p class="field-hint">
+                      每项清理都需要二次确认。清理历史可能影响排查能力。
+                    </p>
+                    <div class="stack-actions">
+                      <button :disabled="busy" v-for="kind in cleanups" class="button secondary full" @click="cleanup(kind.value,kind.label)">
+                        {{kind.label}}
+                      </button>
+                    </div>
+                  </section>
+                  <section class="panel">
+                    <h2>
+                      导入与恢复
+                    </h2>
+                    <p class="field-hint">
+                      导入业务 JSON 不包含浏览器 Cookie。数据库恢复会替换当前数据，请先下载备份。
+                    </p>
+                    <div class="stack-actions">
+                      <label class="button secondary full upload-control">
+                        选择业务 JSON 导入
+                        <input :disabled="busy" type="file" accept="application/json,.json" @change="importFile($event)">
+                      </label>
+                      <label class="button danger-button full upload-control">
+                        选择 SQLite 备份恢复
+                        <input :disabled="busy" type="file" accept=".sqlite,.sqlite3,application/vnd.sqlite3" @change="restoreFile($event)">
+                      </label>
+                    </div>
+                  </section>
+                </div>
+                <section class="panel">
+                  <h2>
+                    缓存状态
+                  </h2>
+                  <div v-for="(value,key) in status.cache" class="status-line">
+                    <span>
+                      {{key}}
+                    </span>
+                    <strong>
+                      {{typeof value==='object'?JSON.stringify(value):value}}
+                    </strong>
+                  </div>
+                </section>
+                <section class="panel">
+                  <h2>
+                    Cookie 会话
+                  </h2>
+                  <div v-for="(session,index) in status.session_statuses" class="session-row">
+                    <div class="status-line">
+                      <span>
+                        {{session.origin||session.session_id||index}}
+                      </span>
+                      <strong>
+                        {{session.validation_status||'未知'}}
+                      </strong>
+                    </div>
+                    <div class="session-actions">
+                      <button :disabled="busy" class="button tiny secondary" @click="sessionStatusAction(session,'refresh')">
+                        刷新会话
+                      </button>
+                      <button :disabled="busy" class="button tiny secondary" @click="sessionStatusAction(session,'clear')">
+                        清理 Cookie
+                      </button>
+                    </div>
+                  </div>
+                  <p v-if="!status.session_statuses?.length" class="subtle-empty">
+                    没有已登记的 Cookie 会话。
+                  </p>
+                </section>
+                <section class="panel">
+                  <h2>
+                    脱敏配置
+                  </h2>
+                  <pre class="preview-json">
+                    {{JSON.stringify(status.config,null,2)}}
+                  </pre>
+                </section>
+              </div>
+            </div>
+            <div v-if="preview" class="modal-backdrop" @click.self="preview=null">
+              <section class="modal">
+                <div class="modal-header">
+                  <div>
+                    <p class="eyebrow">
+                      消息渲染预览
+                    </p>
+                    <h2>
+                      消息预览 · {{previewItems(preview).length}} 条消息
+                    </h2>
+                  </div>
+                  <button :disabled="busy" class="icon-button" @click="preview=null">
+                    ×
+                  </button>
+                </div>
+                <div v-if="!previewItems(preview).length" class="empty-state compact">
+                  后端没有返回可预览的渲染消息
+                </div>
+                <article v-for="(item,index) in previewItems(preview)" class="preview-card">
+                  <div class="preview-card-title">
+                    <div>
+                      <strong>
+                        {{item.title}}
+                      </strong>
+                      <small v-if="item.subtitle" class="preview-subtitle">
+                        {{item.subtitle}}
+                      </small>
+                    </div>
+                    <span>
+                      卡片 {{index+1}} / {{previewItems(preview).length}}
+                    </span>
+                  </div>
+                  <p v-if="item.body" class="preview-body">{{item.body}}</p>
+                  <div v-if="item.originalUrl" class="preview-link">
+                    <span>原文地址：</span>
+                    <a :href="safeUrl(item.originalUrl)" target="_blank" rel="noopener noreferrer">
+                      {{item.originalUrl}}
+                    </a>
+                  </div>
+                  <div v-for="url in item.links" class="preview-link">
+                    <a :href="safeUrl(url)" target="_blank" rel="noopener noreferrer">
+                      {{url}}
+                    </a>
+                  </div>
+                  <small v-if="item.articleIds.length" class="preview-ids">
+                    文章：{{item.articleIds.join('、')}}
+                  </small>
+                </article>
+                <details class="config-details">
+                  <summary>
+                    查看技术详情
+                  </summary>
+                  <pre class="preview-json">
+                    {{JSON.stringify(preview,null,2)}}
+                  </pre>
+                </details>
+              </section>
+            </div>
+          </div>
+        </main>
+      </div>
+    </div>
+  </body>
+</html>

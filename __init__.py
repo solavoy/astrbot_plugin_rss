@@ -1,0 +1,1 @@
+"""AstrBot RSS plugin package."""

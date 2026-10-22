@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:content="http://purl.org/rss/1.0/modules/content/">
+  <channel>
+    <title>Feedback</title><link>https://example.org/c/feedback/2</link>
+    <description>Discourse category feed</description><generator>Discourse</generator>
+    <item>
+      <guid isPermaLink="false">topic-42-post-1</guid>
+      <title>测试反馈 😀</title><link>/t/topic/42/1</link><dc:creator>作者</dc:creator>
+      <pubDate>Mon, 19 Oct 2026 04:00:00 GMT</pubDate>
+      <category>反馈</category>
+      <content:encoded><![CDATA[<div><p>开头 😀 <a href="/help">帮助</a></p><blockquote><p>引用内容</p></blockquote><p><img src="/uploads/photo.png" alt="图片"></p><pre><code class="language-python">print("rss")</code></pre><ul><li>第一项</li><li>第二项</li></ul><p>结束</p></div>]]></content:encoded>
+    </item>
+  </channel>
+</rss>
