@@ -6,18 +6,22 @@ from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1].parent))
 
 from astrbot_plugin_rss.core.config import PluginConfig
-from astrbot_plugin_rss.core.models import Article, ContentBlock, DeliveryTarget
-from astrbot_plugin_rss.normalizers.html_content import normalize_html
-from astrbot_plugin_rss.renderers.default import DefaultRenderer, _block_parts_many, _utf16_length, article_text
-from astrbot_plugin_rss.renderers.feishu import HARD_LIMIT, FeishuRenderer
+from astrbot_plugin_rss.core.models import Article, ContentBlock, DeliveryTarget, FetchResult
+from astrbot_plugin_rss.normalizers.markdown_content import article_markdown, article_media, html_to_markdown
+from astrbot_plugin_rss.parsers.feed_parser import FeedParser
+from astrbot_plugin_rss.renderers.default import DefaultRenderer, _utf16_length, article_text
+from astrbot_plugin_rss.renderers.feishu import HARD_LIMIT, FeishuRenderer, _convert_feishu_markdown
 from astrbot_plugin_rss.renderers.registry import RendererRegistry
-from astrbot_plugin_rss.renderers.telegram import TelegramRenderer, _telegraph_nodes
+from astrbot_plugin_rss.renderers.telegram import TelegramRenderer, _telegraph_markdown_nodes
 
 
 def article(article_id: str, blocks: list[ContentBlock], title: str = "一篇文章") -> Article:
+    media = [item for block in blocks for item in (block.attrs.get("_source_media") or []) if isinstance(item, dict)]
     return Article(
         article_id,
         "feed",
@@ -26,11 +30,241 @@ def article(article_id: str, blocks: list[ContentBlock], title: str = "一篇文
         title,
         first_seen_at=None,
         content_blocks=blocks,
+        metadata={"media": media} if media else {},
     )
+
+
+def markdown_blocks_from_html(value: str, base_url: str = "") -> list[ContentBlock]:
+    media: list[dict] = []
+    markdown = html_to_markdown(value, base_url, media=media)
+    attrs = {"_source_media": media} if media else {}
+    return [ContentBlock("markdown", text=markdown, attrs=attrs)] if markdown else []
+
+
+def telegraph_nodes(item: Article, send_as_media: bool = True) -> list[dict]:
+    return _telegraph_markdown_nodes(article_markdown(item), article_media(item), send_as_media=send_as_media)
 
 
 def target(platform: str = "feishu", session_type: str = "group") -> DeliveryTarget:
     return DeliveryTarget("target", "instance", "platform:instance:group%oc_x", platform, "group%oc_x", session_type)
+
+
+async def test_default_preserves_canonical_markdown_without_feishu_boundary_spaces():
+    markdown = "- **我的项目不存在QQ、TG等群组引流：**是"
+    item = article("cjk-strong", [ContentBlock("markdown", text=markdown)])
+    [default] = await DefaultRenderer().render([item], target("other"), "源")
+    [telegram] = await TelegramRenderer().render([item], target("telegram"), "源")
+    default_text = default.payload["parts"][0]["text"]
+    telegram_text = telegram.payload["parts"][0]["text"]
+    assert markdown in default_text and "**是" in default_text
+    assert markdown in telegram_text and "**是" in telegram_text
+    assert _convert_feishu_markdown(markdown) == "- **我的项目不存在QQ、TG等群组引流：** 是"
+
+
+def test_feishu_markdown_spacing_respects_tokenized_protected_regions():
+    cases = {
+        "**粗体**后 `literal`": "**粗体** 后 `literal`",
+        "**引流：**是 [说明](https://e/a)": "**引流：** 是 [说明](https://e/a)",
+        "**bold *italic***是": "**bold *italic***是",
+        r"\*\*literal\*\*是": r"\*\*literal\*\*是",
+        "![**图片标题**](https://example.org/**url**) **正文**是": "![**图片标题**](https://example.org/**url**) **正文** 是",
+        "Visit <https://example.org/a>.": "Visit <https://example.org/a>.",
+        "Contact <hello@example.org> now.": "Contact <hello@example.org> now.",
+        "Visit &lt;https://example.org/a&gt;.": "Visit &lt;https://example.org/a&gt;.",
+    }
+    for markdown, expected in cases.items():
+        assert _convert_feishu_markdown(markdown) == expected
+
+
+async def test_feishu_converts_setext_indented_code_and_raw_html_safely():
+    markdown = (
+        "Heading\n=======\n\n"
+        "    print(1)\n\n"
+        "<div>safe <strong>text</strong><script>bad()</script></div>\n\n"
+        "`<span>literal</span>`"
+    )
+    item = article("feishu-compat", [ContentBlock("markdown", text=markdown)])
+    [message] = await FeishuRenderer().render([item], target(), "源")
+    body = "\n".join(
+        element.get("content", "")
+        for element in message.payload["card"]["body"]["elements"]
+        if element.get("tag") == "markdown"
+    )
+    assert "# Heading" in body
+    assert "```\nprint(1)\n```" in body
+    assert "safe **text**" in body
+    assert "bad()" not in body and "<div>" not in body
+    assert "`<span>literal</span>`" in body
+
+
+@pytest.mark.parametrize("send_as_media", [True, False])
+async def test_html_promotion_renders_bold_and_inline_gift_in_all_platforms(send_as_media):
+    html = (
+        "<p>充值比例 <strong>1:1，无套路</strong>。</p>"
+        '<p><img src="https://cdn.ldstatic.com/images/emoji/twemoji/wrapped_gift.png?v=15" '
+        'title=":wrapped_gift:" class="emoji" alt=":wrapped_gift:" width="20" height="20"> '
+        "<strong>进群送 5 刀体验额度</strong></p>"
+    )
+    xml = (
+        "<rss><channel><title>Feed</title><item><guid>promo</guid><title>Promo</title>"
+        "<link>https://example.org/promo</link><description><![CDATA[" + html + "]]></description>"
+        "</item></channel></rss>"
+    ).encode()
+    item = FeedParser().parse(FetchResult("f", "https://example.org/feed", status_code=200, raw_xml=xml)).articles[0]
+    config = PluginConfig(send_as_media=send_as_media)
+    default = (await DefaultRenderer(config).render([item], target("other"), "源"))[0]
+    body_parts = default.payload["parts"]
+    assert len(body_parts) == 1 and body_parts[0]["type"] == "text"
+    assert "充值比例 **1:1，无套路**。" in body_parts[0]["text"]
+    assert "🎁 **进群送 5 刀体验额度**" in body_parts[0]["text"]
+    assert "🎁 **进群送 5 刀体验额度**" in article_text(item)
+
+    card = (
+        await FeishuRenderer(config, image_key=lambda *_: _unexpected_media_callback()).render([item], target(), "源")
+    )[0].payload["card"]
+    elements = card["body"]["elements"]
+    card_body = "\n".join(element.get("content", "") for element in elements)
+    assert "充值比例 **1:1，无套路** 。" in card_body
+    assert "🎁 **进群送 5 刀体验额度**" in card_body
+    assert not any(element["tag"] == "img" for element in elements)
+
+    nodes = telegraph_nodes(item, send_as_media)
+    assert nodes[0] == {"tag": "p", "children": ["充值比例 ", {"tag": "strong", "children": ["1:1，无套路"]}, "。"]}
+    assert nodes[1] == {"tag": "p", "children": ["🎁 ", {"tag": "strong", "children": ["进群送 5 刀体验额度"]}]}
+
+
+async def test_cached_gift_is_inline_but_real_small_and_custom_images_stay_media():
+    cached = article(
+        "cached-inline",
+        [
+            ContentBlock(
+                "paragraph",
+                children=[
+                    ContentBlock(
+                        "image", url="https://example.org/gift.png", attrs={"class": ["emoji"], "alt": ":wrapped_gift:"}
+                    ),
+                    ContentBlock("text", " "),
+                    ContentBlock("strong", text="Gift text"),
+                    ContentBlock(
+                        "image", url="https://example.org/photo.png", attrs={"width": 20, "height": 20, "alt": ":gift:"}
+                    ),
+                    ContentBlock(
+                        "image",
+                        url="https://example.org/custom.png",
+                        attrs={"class": ["emoji", "emoji-custom"], "alt": ":gift:"},
+                    ),
+                ],
+            )
+        ],
+    )
+    original = [block.to_dict() for block in cached.content_blocks]
+    uploads = []
+
+    async def image_key(_target, url, _alt):
+        uploads.append(url)
+        return "key:" + url
+
+    [message] = await FeishuRenderer(image_key=image_key).render([cached], target(), "源")
+    elements = message.payload["card"]["body"]["elements"]
+    assert elements[0]["tag"] == "markdown" and elements[0]["content"].strip() == "🎁 **Gift text**"
+    assert uploads == ["https://example.org/photo.png", "https://example.org/custom.png"]
+    assert len([element for element in elements if element["tag"] == "img"]) == 2
+    [message] = await DefaultRenderer().render([cached], target("other"), "源")
+    assert "🎁 **Gift text**" in message.payload["parts"][0]["text"]
+    assert all(part["type"] == "text" for part in message.payload["parts"])
+    assert "![" in message.payload["parts"][0]["text"]
+    assert all(url in message.payload["parts"][0]["text"] for url in uploads)
+    assert [block.to_dict() for block in cached.content_blocks] == original
+
+
+async def test_styles_nest_without_duplicate_delimiters_keep_spaces_and_protect_code():
+    item = article(
+        "styles",
+        markdown_blocks_from_html(
+            "<p>A<strong>  bold <b>again</b> <em>italic</em>  </strong>Z "
+            "<code><strong>literal</strong> `x`</code></p><pre><strong>raw</strong></pre>"
+        ),
+    )
+    expected = "A **bold again *italic*** Z `` literal `x` ``"
+    [default] = await DefaultRenderer().render([item], target("other"), "源")
+    assert expected in default.payload["parts"][0]["text"]
+    [feishu] = await FeishuRenderer().render([item], target(), "源")
+    contents = [element.get("content", "") for element in feishu.payload["card"]["body"]["elements"]]
+    assert expected in contents[0]
+    assert "```\nraw\n```" in contents[0]
+    nodes = telegraph_nodes(item)
+    assert nodes[0]["children"][-1] == {"tag": "code", "children": ["literal `x`"]}
+    assert nodes[1] == {"tag": "pre", "children": [{"tag": "code", "children": ["raw\n"]}]}
+
+
+async def test_truncation_keeps_markdown_structures_whole_or_degrades_to_safe_prose():
+    item = article("styled-truncation", markdown_blocks_from_html("<p>🎁 <strong>很长的加粗正文内容</strong>。</p>"))
+    config = PluginConfig(enable_content_truncation=True, content_truncation_length=6)
+    [default] = await DefaultRenderer(config).render([item], target("other"), "源")
+    assert "🎁 很长的…" in default.payload["parts"][0]["text"]
+    [feishu] = await FeishuRenderer(config).render([item], target(), "源")
+    truncated = feishu.payload["card"]["body"]["elements"][0]["content"]
+    assert "🎁 很长的…" in truncated
+    assert truncated.count("**") % 2 == 0
+
+    long_item = article("long-styles", markdown_blocks_from_html("<p><strong>" + "加粗正文" * 2000 + "</strong></p>"))
+    [default] = await DefaultRenderer().render([long_item], target("telegram"), "源")
+    body = default.payload["parts"][0]["text"]
+    assert _utf16_length(body) <= 4096
+    assert "加粗正文" in body and "…" in body
+    assert body.count("**") == 2  # The body degrades to visible prose on truncation.
+    renderer = FeishuRenderer(PluginConfig(feishu_max_card_bytes=2000))
+    [feishu] = await renderer.render([long_item], target(), "源")
+    content = feishu.payload["card"]["body"]["elements"][0]["content"]
+    assert "加粗正文" in content and "…" in content
+    assert content.count("**") == 0
+    assert renderer.request_size(feishu, target()) <= 2000
+
+
+async def test_default_preserves_markdown_image_source_and_feishu_splits_native_image():
+    item = article(
+        "style-image",
+        markdown_blocks_from_html('<p><strong>before<img src="/photo.png">after</strong></p>', "https://example.org/"),
+    )
+
+    async def image_key(*_):
+        return "photo-key"
+
+    [default] = await DefaultRenderer().render([item], target("other"), "源")
+    parts = default.payload["parts"]
+    assert len(parts) == 1 and parts[0]["type"] == "text"
+    assert "![" in parts[0]["text"] and "https://example.org/photo.png" in parts[0]["text"]
+    [feishu] = await FeishuRenderer(image_key=image_key).render([item], target(), "源")
+    elements = feishu.payload["card"]["body"]["elements"]
+    assert elements[0] == {"tag": "markdown", "content": "**before**"}
+    assert elements[1]["tag"] == "img" and elements[1]["img_key"] == "photo-key"
+    assert elements[2] == {"tag": "markdown", "content": "**after**"}
+
+
+def test_telegraph_markdown_keeps_emphasis_and_links_in_table_cells():
+    item = article(
+        "telegraph-markdown-table",
+        markdown_blocks_from_html(
+            "<table><tr><td><strong>Bold</strong></td><td><em>Italic</em> "
+            '<a href="https://example.org/help"><b>Help</b></a></td></tr></table>'
+        ),
+    )
+    assert telegraph_nodes(item) == [
+        {
+            "tag": "p",
+            "children": [
+                {"tag": "strong", "children": ["Bold"]},
+                " | ",
+                {"tag": "em", "children": ["Italic"]},
+                " ",
+                {
+                    "tag": "a",
+                    "attrs": {"href": "https://example.org/help"},
+                    "children": [{"tag": "strong", "children": ["Help"]}],
+                },
+            ],
+        }
+    ]
 
 
 async def test_renderers_use_configured_timezone_and_timestamp_fallbacks(monkeypatch):
@@ -124,7 +358,7 @@ async def test_feishu_list_batches_complete_articles_and_single_article_fits() -
         assert any("原文地址" in elem.get("content", "") for elem in message.payload["card"]["body"]["elements"])
 
 
-async def test_default_renderer_keeps_list_full_and_direct_truncation_uses_blocks() -> None:
+async def test_default_renderer_keeps_markdown_and_applies_configured_truncation() -> None:
     config = PluginConfig(enable_content_truncation=True, content_truncation_length=8)
     renderer = DefaultRenderer(config)
     item = article(
@@ -141,14 +375,15 @@ async def test_default_renderer_keeps_list_full_and_direct_truncation_uses_block
     direct_body = "".join(p.get("text", "") for p in direct_parts)
     listed_body = "".join(p.get("text", "") for p in list_parts)
     assert len(direct_body) < len(listed_body)
-    assert any(p["type"] == "image" for p in list_parts)
+    assert all(p["type"] == "text" for p in list_parts)
+    assert "![图](https://example.org/a.png)" in listed_body
     assert "作者：未知作者 | 源" in listed_body
     assert "原文地址：[https://example.org/a](https://example.org/a)" in listed_body
-    assert "作者：未知作者 | 源\n\n这是很长的第一段内容。" in listed_body
+    assert "这是很长的第一段内容。" in listed_body
     assert "原文地址：[https://example.org/a](https://example.org/a)" in article_text(item)
 
 
-async def test_default_renderer_long_telegram_text_keeps_video_as_separate_operation():
+async def test_default_renderer_sends_long_telegram_markdown_without_rebuilding_video_links():
     item = article(
         "long-video",
         [
@@ -157,10 +392,10 @@ async def test_default_renderer_long_telegram_text_keeps_video_as_separate_opera
         ],
     )
     messages = await DefaultRenderer(PluginConfig()).render([item], target("telegram"), "源")
-    assert [message.message_type for message in messages] == ["parts", "video"]
+    assert [message.message_type for message in messages] == ["parts"]
     body = "".join(part.get("text", "") for part in messages[0].payload["parts"])
     assert len(body.encode("utf-16-le")) // 2 <= 4096
-    assert messages[1].payload["url"] == "https://example.org/clip.mp4"
+    assert "原文地址：[https://example.org/long-video](https://example.org/long-video)" in body
 
 
 def test_telegraph_uses_valid_node_tree_and_preserves_ordered_media() -> None:
@@ -169,9 +404,10 @@ def test_telegraph_uses_valid_node_tree_and_preserves_ordered_media() -> None:
         ContentBlock("image", url="https://example.org/img.png"),
         ContentBlock("code", "print(1)"),
     ]
-    nodes = _telegraph_nodes(blocks)
-    assert [n["tag"] for n in nodes] == ["p", "img", "pre"]
+    nodes = telegraph_nodes(article("ordered-media", blocks))
+    assert [n["tag"] for n in nodes] == ["p", "p", "pre"]
     assert nodes[0]["children"] == ["先文字"]
+    assert nodes[1]["children"] == [{"tag": "img", "attrs": {"src": "https://example.org/img.png"}}]
 
 
 def test_send_as_media_false_uses_links_for_default_feishu_and_telegraph():
@@ -202,28 +438,34 @@ def test_send_as_media_false_uses_links_for_default_feishu_and_telegraph():
     card_body = "\n".join(item["content"] for item in card_messages[0].payload["card"]["body"]["elements"])
     assert "https://example.org/p.png" in card_body
     assert "https://example.org/v.mp4" in card_body
-    telegraph = _telegraph_nodes(
-        [
-            ContentBlock("paragraph", children=[ContentBlock("image", url="https://example.org/p.png")]),
-            ContentBlock("video", url="https://example.org/v.mp4"),
-        ],
+    telegraph = telegraph_nodes(
+        article(
+            "media-off-telegraph",
+            [
+                ContentBlock("paragraph", children=[ContentBlock("image", url="https://example.org/p.png")]),
+                ContentBlock("video", url="https://example.org/v.mp4"),
+            ],
+        ),
         send_as_media=False,
     )
     assert telegraph[0]["children"][0]["tag"] == "a"
-    assert telegraph[1]["tag"] == "a"
+    assert telegraph[1]["children"][0]["tag"] == "a"
 
 
 async def _unexpected_media_callback():
     raise AssertionError("send_as_media=False must skip media download/upload")
 
 
-def test_telegraph_converts_real_normalizer_nested_blocks_without_losing_order() -> None:
-    blocks = normalize_html(
-        '<p>先<a href="https://example.org/link">链接</a><img src="https://example.org/a.png" alt="图">后</p>'
-        '<blockquote><p>引用</p><img src="https://example.org/q.png"></blockquote>',
-        "https://example.org/feed",
+def test_telegraph_markdown_preserves_normalized_media_and_order() -> None:
+    item = article(
+        "telegraph-normalized",
+        markdown_blocks_from_html(
+            '<p>先<a href="https://example.org/link">链接</a><img src="https://example.org/a.png" alt="图">后</p>'
+            '<blockquote><p>引用</p><img src="https://example.org/q.png"></blockquote>',
+            "https://example.org/feed",
+        ),
     )
-    nodes = _telegraph_nodes(blocks)
+    nodes = telegraph_nodes(item)
     assert nodes[0]["tag"] == "p"
     assert nodes[0]["children"] == [
         "先",
@@ -232,15 +474,19 @@ def test_telegraph_converts_real_normalizer_nested_blocks_without_losing_order()
         "后",
     ]
     assert nodes[1]["tag"] == "blockquote"
-    assert [n["tag"] for n in nodes[1]["children"]] == ["p", "img"]
+    assert [n["tag"] for n in nodes[1]["children"]] == ["p", "p"]
+    assert nodes[1]["children"][1]["children"] == [{"tag": "img", "attrs": {"src": "https://example.org/q.png"}}]
 
 
 def test_telegraph_flattens_nested_lightbox_children_in_both_media_modes():
-    blocks = normalize_html(
-        '<div><p>x</p><div class="lightbox-wrapper"><a class="lightbox" '
-        'href="https://example.org/full.png"><img src="https://example.org/preview.png" alt="图"></a>'
-        "</div></div>",
-        "https://example.org/feed",
+    item = article(
+        "telegraph-lightbox",
+        markdown_blocks_from_html(
+            '<div><p>x</p><div class="lightbox-wrapper"><a class="lightbox" '
+            'href="https://example.org/full.png"><img src="https://example.org/preview.png" alt="图"></a>'
+            "</div></div>",
+            "https://example.org/feed",
+        ),
     )
 
     def validate_nodes(value):
@@ -254,8 +500,8 @@ def test_telegraph_flattens_nested_lightbox_children_in_both_media_modes():
                 flattened.extend(validate_nodes(node.get("children", [])))
         return flattened
 
-    embedded = _telegraph_nodes(blocks, send_as_media=True)
-    linked = _telegraph_nodes(blocks, send_as_media=False)
+    embedded = telegraph_nodes(item, send_as_media=True)
+    linked = telegraph_nodes(item, send_as_media=False)
     embedded_nodes = validate_nodes(embedded)
     linked_nodes = validate_nodes(linked)
     assert any(node.get("tag") == "img" for node in embedded_nodes)
@@ -263,16 +509,19 @@ def test_telegraph_flattens_nested_lightbox_children_in_both_media_modes():
 
 
 def test_telegraph_emits_only_documented_element_tags_and_no_text_tag() -> None:
-    nodes = _telegraph_nodes(
-        [
-            ContentBlock(
-                "paragraph",
-                children=[
-                    ContentBlock("link", url="https://example.org", children=[ContentBlock("text", "link")]),
-                    ContentBlock("image", url="https://example.org/img.png"),
-                ],
-            )
-        ]
+    nodes = telegraph_nodes(
+        article(
+            "telegraph-markdown-tags",
+            [
+                ContentBlock(
+                    "markdown",
+                    text=(
+                        "# Heading\n\n> Quote\n\n- [link](https://example.org)\n"
+                        "- ![image](https://example.org/img.png)\n\n```python\nprint('ok')\n```"
+                    ),
+                )
+            ],
+        )
     )
     allowed = {
         "a",
@@ -312,7 +561,7 @@ def test_telegraph_emits_only_documented_element_tags_and_no_text_tag() -> None:
         check(node)
 
 
-async def test_direct_truncation_is_shared_and_nested_media_stays_ordered() -> None:
+async def test_feishu_direct_truncation_omits_incomplete_markdown_and_keeps_list_media_order() -> None:
     config = PluginConfig(enable_content_truncation=True, content_truncation_length=8)
     nested = ContentBlock(
         "paragraph",
@@ -323,18 +572,19 @@ async def test_direct_truncation_is_shared_and_nested_media_stays_ordered() -> N
         ],
     )
     item = article("nested", [nested])
-    feishu = FeishuRenderer(config)
+
+    async def image_key(_target, url, _alt):
+        return "key:" + url
+
+    feishu = FeishuRenderer(config, image_key=image_key)
     direct = await feishu.render([item], target(), "源", is_list=False)
     listed = await feishu.render([item], target(), "源", is_list=True)
     direct_md = "\n".join(e.get("content", "") for e in direct[0].payload["card"]["body"]["elements"])
     listed_md = "\n".join(e.get("content", "") for e in listed[0].payload["card"]["body"]["elements"])
     assert len(direct_md) < len(listed_md)
-    assert "段中图片" in direct_md
-    parts = _block_parts_many(nested)
-    media_index = next(i for i, part in enumerate(parts) if part["type"] == "image")
-    assert [p["type"] for p in parts[:media_index]] == ["text"]
-    assert [p["type"] for p in parts[media_index + 1 :]] == ["text", "text"]
-    assert parts[media_index]["url"] == "https://example.org/p.png"
+    assert "…" in direct_md
+    assert any(element.get("tag") == "img" for element in direct[0].payload["card"]["body"]["elements"])
+    assert any(element.get("tag") == "img" for element in listed[0].payload["card"]["body"]["elements"])
 
 
 async def test_telegram_hard_fit_clips_nested_paragraph_within_4096() -> None:
@@ -384,22 +634,18 @@ async def test_feishu_truncated_card_retains_uploaded_image_key() -> None:
 
 
 async def test_feishu_embeds_uploaded_discourse_images_without_wrapping_links() -> None:
-    from astrbot_plugin_rss.normalizers.discourse import normalize_image_links
-
     original_urls = [
         "https://forum.example/uploads/default/original/2X/first.png",
         "https://forum.example/uploads/default/original/2X/second.jpg",
         "https://forum.example/uploads/default/original/2X/third.png",
     ]
-    blocks = normalize_image_links(
-        normalize_html(
-            '<p>前<img src="/uploads/default/original/2X/first.png" alt="第一图">中</p>'
-            '<p><a href="/uploads/default/original/2X/second.jpg">image</a></p>'
-            '<p>再<a class="lightbox-wrapper" href="/uploads/default/original/2X/third.png">'
-            '<img src="/uploads/default/optimized/2X/third.png" alt="第三图"></a>后</p>'
-            '<p><a href="https://example.org/article/1">普通文章</a></p>',
-            "https://forum.example/t/topic/3048407",
-        )
+    blocks = markdown_blocks_from_html(
+        '<p>前<img src="/uploads/default/original/2X/first.png" alt="第一图">中</p>'
+        '<p><a href="/uploads/default/original/2X/second.jpg">image</a></p>'
+        '<p>再<a class="lightbox-wrapper" href="/uploads/default/original/2X/third.png">'
+        '<img src="/uploads/default/optimized/2X/third.png" alt="第三图"></a>后</p>'
+        '<p><a href="https://example.org/article/1">普通文章</a></p>',
+        "https://forum.example/t/topic/3048407",
     )
     blocks.append(
         ContentBlock(
@@ -455,7 +701,7 @@ async def test_feishu_image_upload_failure_keeps_one_chinese_source_link() -> No
 async def test_feishu_generic_anchor_image_upload_preserves_article_href_and_text_order() -> None:
     item = article(
         "generic-anchor-image",
-        normalize_html(
+        markdown_blocks_from_html(
             '<p>图片前<a href="https://example.org/article/1">'
             '<img src="https://cdn.example.org/picture.jpg" alt="封面">更多</a>图片后</p>'
             '<p><a href="https://example.org/image">image</a></p>'
@@ -474,7 +720,7 @@ async def test_feishu_generic_anchor_image_upload_preserves_article_href_and_tex
     assert uploads == ["https://cdn.example.org/picture.jpg"]
     image_index = next(i for i, element in enumerate(elements) if element.get("tag") == "img")
     assert elements[image_index]["img_key"] == "image-key:cover"
-    assert "[相关链接](https://example.org/article/1)" in body
+    assert "[更多](https://example.org/article/1)" in body
     assert body.count("更多") == 1
     assert "https://cdn.example.org/picture.jpg" not in body
     assert "[image](https://example.org/image)" in body
@@ -484,7 +730,7 @@ async def test_feishu_generic_anchor_image_upload_preserves_article_href_and_tex
     assert "更多" in after_image and after_image.index("更多") < after_image.index("图片后")
 
 
-async def test_feishu_native_image_size_preserves_emoji_and_avoids_upscaling() -> None:
+async def test_feishu_native_image_size_preserves_custom_emoji_and_avoids_upscaling() -> None:
     sizes_requested = []
 
     async def image_key(_target, url, _alt):
@@ -506,8 +752,8 @@ async def test_feishu_native_image_size_preserves_emoji_and_avoids_upscaling() -
 
     item = article(
         "native-image-sizing",
-        normalize_html(
-            '<p>before<img class="emoji" src="https://example.org/tiny.png" alt=":lion:">'
+        markdown_blocks_from_html(
+            '<p>before<img class="emoji" src="https://example.org/tiny.png" alt=":custom_lion:">'
             '<img class="emoji" src="https://example.org/rect-emoji.png" alt="rectangle">'
             '<img src="https://example.org/small.png" width="80" height="60" alt="small">'
             '<img src="https://example.org/width-only.png" width="40" alt="width only">'
@@ -744,5 +990,7 @@ async def test_feishu_registry_routes_pure_video_through_default_sender_in_batch
 
     assert [message.message_type for message in messages] == ["parts", "video", "interactive"]
     assert [message.article_ids for message in messages] == [["pure-video"], ["pure-video"], ["ordinary"]]
+    assert video_url not in messages[0].payload["parts"][0]["text"]
     assert messages[1].payload["url"] == video_url
+    assert sum(message.message_type == "video" and message.payload.get("url") == video_url for message in messages) == 1
     assert downloader.calls == []

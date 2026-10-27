@@ -11,8 +11,8 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1].parent))
 
 from astrbot_plugin_rss.core.errors import PlatformUnsupportedError, UnknownSendResultError
-from astrbot_plugin_rss.core.models import Article, DeliveryTarget, RenderedMessage
-from astrbot_plugin_rss.normalizers.html_content import normalize_html
+from astrbot_plugin_rss.core.models import Article, ContentBlock, DeliveryTarget, RenderedMessage
+from astrbot_plugin_rss.normalizers.markdown_content import html_to_markdown
 from astrbot_plugin_rss.renderers.default import DefaultRenderer
 from astrbot_plugin_rss.senders.platform import CardSizeValidator, PlatformSender, _lark_recipient
 
@@ -336,7 +336,7 @@ async def test_preflight_reports_unsupported_message_without_sending() -> None:
 
 
 @pytest.mark.asyncio
-async def test_normalizer_default_renderer_and_sender_preserve_nested_content_order(
+async def test_default_renderer_and_sender_preserve_canonical_markdown_order(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     event = types.ModuleType("astrbot.api.event")
@@ -355,14 +355,21 @@ async def test_normalizer_default_renderer_and_sender_preserve_nested_content_or
         return SimpleNamespace(url=url)
 
     monkeypatch.setattr(sender_module, "validate_public_url", validate)
-    blocks = normalize_html(
+    markdown = html_to_markdown(
         '<p>Alpha <a href="https://example.org/link">linked label</a> then '
         '<img src="https://example.org/pic.png" alt="inline picture"> tail</p>'
         "<p>Second paragraph</p><blockquote><p>Quoted line</p></blockquote>"
         "<ul><li>List item</li></ul>",
         "https://example.org/feed",
     )
-    article = Article("a", "f", "entry", "https://example.org/source", "Article", content_blocks=blocks)
+    article = Article(
+        "a",
+        "f",
+        "entry",
+        "https://example.org/source",
+        "Article",
+        content_blocks=[ContentBlock("markdown", text=markdown)],
+    )
     target = DeliveryTarget("t", "i", "origin", "other", "s")
     [message] = await DefaultRenderer().render([article], target, "Source")
     sent = {}
@@ -377,12 +384,8 @@ async def test_normalizer_default_renderer_and_sender_preserve_nested_content_or
     output = "".join(component.text for component in chain if isinstance(component, FakePlain))
     assert output.index("Alpha") < output.index("linked label") < output.index("https://example.org/link")
     assert output.index("https://example.org/link") < output.index(" then ")
-    image_index = chain.index(("image", "https://example.org/pic.png"))
-    assert (
-        chain.index(next(item for item in chain if isinstance(item, FakePlain) and " then " in item.text)) < image_index
-    )
-    assert image_index < chain.index(
-        next(item for item in chain if isinstance(item, FakePlain) and " tail" in item.text)
-    )
+    assert "![inline picture](https://example.org/pic.png)" in output
+    assert output.index(" then ") < output.index("![inline picture]") < output.index(" tail")
     assert output.index("tail") < output.index("Second paragraph") < output.index("> Quoted line")
-    assert output.index("> Quoted line") < output.index("• ") < output.index("List item")
+    assert output.index("> Quoted line") < output.index("- ") < output.index("List item")
+    assert not any(isinstance(component, tuple) and component[0] == "image" for component in chain)

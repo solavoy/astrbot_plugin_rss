@@ -1,57 +1,9 @@
 from __future__ import annotations
 
-from typing import Any
-
 from ..core.errors import RenderingError
-from ..core.models import Article, ContentBlock, DeliveryTarget, RenderedMessage
-from ..normalizers.discourse import clean_cached_article
-from .blocks import truncate_content_blocks
+from ..core.models import Article, DeliveryTarget, RenderedMessage
+from ..normalizers.markdown_content import article_markdown, clean_cached_article, markdown_tokens
 from .time_format import format_published
-
-
-def block_text(block: ContentBlock) -> str:
-    kind = block.type.lower()
-    if kind in {"text", "paragraph", "heading", "quote", "code"}:
-        text = block.text or "".join(block_text(c) for c in block.children)
-        if kind == "heading":
-            return f"\n{text}\n"
-        if kind == "quote":
-            return "\n".join(f"> {line}" for line in text.splitlines()) + "\n"
-        if kind == "code":
-            lang = str(block.attrs.get("language", ""))
-            return f"\n```{lang}\n{text}\n```\n"
-        return text + ("\n\n" if kind == "paragraph" else "")
-    if kind in {"image", "video", "audio", "attachment", "link"}:
-        label = (
-            "".join(block_text(c) for c in block.children).strip()
-            or block.text
-            or block.attrs.get("alt")
-            or block.attrs.get("title")
-            or kind.capitalize()
-        )
-        url = block.url
-        if not url:
-            return ""
-        return f"[{label}]({url})"
-    if kind == "list":
-        ordered = bool(block.attrs.get("ordered"))
-        return (
-            "\n".join(
-                f"{i}. {block_text(c)}" if ordered else f"• {block_text(c)}" for i, c in enumerate(block.children, 1)
-            )
-            + "\n"
-        )
-    if kind == "table":
-        return "\n".join(" | ".join(block_text(c) for c in row.children) for row in block.children) + "\n"
-    return block.text + "".join(block_text(c) for c in block.children)
-
-
-def article_text(article: Article, timezone: str = "Asia/Shanghai") -> str:
-    article = clean_cached_article(article)
-    chunks = [f"**{article.title}**", _article_meta(article, timezone=timezone)]
-    chunks.extend(block_text(b) for b in article.content_blocks)
-    chunks.extend([f"\n原文地址：[{article.canonical_url}]({article.canonical_url})"])
-    return "\n\n".join(x for x in chunks if x)
 
 
 def _published(article: Article, timezone: str = "Asia/Shanghai") -> str:
@@ -61,103 +13,6 @@ def _published(article: Article, timezone: str = "Asia/Shanghai") -> str:
     if timestamp is None:
         timestamp = article.first_seen_at
     return format_published(timestamp, timezone)
-
-
-class DefaultRenderer:
-    """Ordered plain-text/Markdown fallback with a configurable hard text cap."""
-
-    def __init__(self, config: object | None = None) -> None:
-        self.config = config
-
-    async def render(
-        self,
-        articles: list[Article],
-        target: DeliveryTarget,
-        source_name: str,
-        is_list: bool = False,
-        batch_id: str = "",
-        **kwargs: object,
-    ) -> list[RenderedMessage]:
-        # Telegram is the only platform for which this fallback uses a known
-        # text hard cap. Unknown adapters own their transport limit.
-        hard_limit = 4096 if "telegram" in target.platform.lower() else None
-        ordinary_truncate = not is_list and bool(getattr(self.config, "enable_content_truncation", False))
-        ordinary_length = int(getattr(self.config, "content_truncation_length", 0) or 0)
-        timezone = str(getattr(self.config, "timezone", "Asia/Shanghai") or "Asia/Shanghai")
-        send_as_media = bool(getattr(self.config, "send_as_media", True))
-        payloads: list[RenderedMessage] = []
-        current: list[dict[str, Any]] = []
-        ids: list[str] = []
-        for article in articles:
-            article = clean_cached_article(article)
-            blocks = article.content_blocks
-            if ordinary_truncate and ordinary_length > 0:
-                blocks = _truncate_blocks(blocks, ordinary_length)
-            parts: list[dict[str, Any]] = [{"type": "text", "text": _article_heading(article, source_name, timezone)}]
-            for block in blocks:
-                parts.extend(_block_parts_many(block, send_as_media=send_as_media))
-            parts.append({"type": "text", "text": f"\n原文地址：[{article.canonical_url}]({article.canonical_url})"})
-            parts = [p for p in parts if p.get("text") or p.get("url")]
-            article_has_video = send_as_media and _contains_type(blocks, "video")
-            if article_has_video and ids:
-                payloads.append(RenderedMessage("default", "parts", {"parts": current}, ids, batch_id))
-                current, ids = [], []
-            candidate = current + parts
-            if hard_limit and _visible_length(candidate) > hard_limit and ids:
-                payloads.append(RenderedMessage("default", "parts", {"parts": current}, ids, batch_id))
-                current, ids = [], []
-                candidate = current + parts
-            if hard_limit and _visible_length(candidate) > hard_limit:
-                parts = _hard_fit_article(
-                    article,
-                    source_name,
-                    hard_limit - _visible_length(current),
-                    send_as_media=send_as_media,
-                    timezone=timezone,
-                )
-            current.extend(parts)
-            ids.append(article.article_id)
-            if article_has_video:
-                payloads.append(RenderedMessage("default", "parts", {"parts": current}, ids, batch_id))
-                current, ids = [], []
-        if ids:
-            payloads.append(RenderedMessage("default", "parts", {"parts": current}, ids, batch_id))
-        return _split_video_operations(payloads)
-
-
-def _contains_type(blocks: list[ContentBlock], wanted: str) -> bool:
-    return any(block.type.lower() == wanted or _contains_type(block.children, wanted) for block in blocks)
-
-
-def _split_video_operations(messages: list[RenderedMessage]) -> list[RenderedMessage]:
-    result: list[RenderedMessage] = []
-    for message in messages:
-        if message.message_type != "parts":
-            result.append(message)
-            continue
-        current: list[dict[str, Any]] = []
-        videos: list[dict[str, Any]] = []
-        parts = message.payload.get("parts", [])
-        for part in parts:
-            if part.get("type") == "video" and part.get("url"):
-                videos.append(part)
-            else:
-                current.append(part)
-        if current:
-            result.append(
-                RenderedMessage(message.renderer, "parts", {"parts": current}, message.article_ids, message.batch_id)
-            )
-        result.extend(
-            RenderedMessage(
-                message.renderer,
-                "video",
-                {"url": part["url"], "alt": part.get("alt", "")},
-                message.article_ids,
-                message.batch_id,
-            )
-            for part in videos
-        )
-    return result
 
 
 def _article_meta(article: Article, source_name: str = "", timezone: str = "Asia/Shanghai") -> str:
@@ -172,126 +27,90 @@ def _article_meta(article: Article, source_name: str = "", timezone: str = "Asia
 
 
 def _article_heading(article: Article, source_name: str = "", timezone: str = "Asia/Shanghai") -> str:
-    return f"\n\n**{article.title}**\n{_article_meta(article, source_name, timezone)}\n\n"
+    return f"**{article.title}**\n{_article_meta(article, source_name, timezone)}"
 
 
-def _block_parts(block: ContentBlock, send_as_media: bool = True) -> dict[str, Any]:
-    if block.type.lower() in {"image", "video", "audio", "attachment"}:
-        if not send_as_media:
-            label = block.attrs.get("alt") or block.attrs.get("title") or block.type.capitalize()
-            return (
-                _text_part(f"[{label}]({block.url})", block.type.lower()) if block.url else _text_part("", block.type)
-            )
-        return {
-            "type": block.type.lower(),
-            "url": block.url,
-            "alt": block.attrs.get("alt") or block.attrs.get("title") or "",
-        }
-    return {"type": "text", "text": block_text(block), "block_type": block.type, "structured": bool(block.children)}
-
-
-def _block_parts_many(block: ContentBlock, send_as_media: bool = True) -> list[dict[str, Any]]:
-    if block.type.lower() in {"image", "video", "audio", "attachment"}:
-        return [_block_parts(block, send_as_media=send_as_media)]
-    if block.type.lower() == "link":
-        return [
-            {
-                "type": "link",
-                "text": "".join(block_text(c) for c in block.children)
-                or block.text
-                or block.attrs.get("title")
-                or "Link",
-                "url": block.url,
-                "block_type": "link",
-                "structured": True,
-            }
-        ]
-    if block.children:
-        kind = block.type.lower()
-        if kind == "list":
-            result: list[dict[str, Any]] = []
-            ordered = bool(block.attrs.get("ordered"))
-            for index, child in enumerate(block.children, 1):
-                result.append(_text_part(f"{index}. " if ordered else "• ", "list"))
-                result.extend(_block_parts_many(child, send_as_media=send_as_media))
-                result.append(_text_part("\n", "list"))
-            return result
-        if kind == "table":
-            result = []
-            for row_index, row in enumerate(block.children):
-                if row_index:
-                    result.append(_text_part("\n", "table"))
-                for cell_index, cell in enumerate(row.children):
-                    if cell_index:
-                        result.append(_text_part(" | ", "table"))
-                    result.extend(_block_parts_many(cell, send_as_media=send_as_media))
-            return result
-        result: list[dict[str, Any]] = []
-        if block.text:
-            result.append(_text_part(block.text, kind, structured=True))
-        for child in block.children:
-            child_parts = _block_parts_many(child, send_as_media=send_as_media)
-            if kind == "quote":
-                child_parts = [_quote_part(part) for part in child_parts]
-            result.extend(child_parts)
-        if kind == "paragraph":
-            result.append(_text_part("\n\n", kind, structured=True))
-        elif kind == "heading":
-            level = min(6, max(1, int(block.attrs.get("level", 2))))
-            result.insert(0, _text_part("#" * level + " ", kind, structured=True))
-            result.append(_text_part("\n", kind, structured=True))
-        elif kind == "quote":
-            result.append(_text_part("\n", kind, structured=True))
-        elif kind == "code":
-            language = str(block.attrs.get("language", ""))
-            result.insert(0, _text_part(f"```{language}\n", kind, structured=True))
-            result.append(_text_part("\n```\n", kind, structured=True))
-        return result
-    return [_block_parts(block)]
-
-
-def _text_part(text: str, kind: str, structured: bool = False) -> dict[str, Any]:
-    return {"type": "text", "text": text, "block_type": kind, "structured": structured}
-
-
-def _quote_part(part: dict[str, Any]) -> dict[str, Any]:
-    if part.get("type") != "text":
-        return part
-    text = str(part.get("text", ""))
-    prefix = "> "
-    lines = text.splitlines(keepends=True)
-    quoted = "".join(prefix + line if line.strip() else line for line in lines)
-    if text and not lines:
-        quoted = prefix + text
-    return {**part, "text": quoted}
+def article_text(article: Article, timezone: str = "Asia/Shanghai") -> str:
+    """Return the article as Markdown without rebuilding it from content nodes."""
+    article = clean_cached_article(article)
+    body = article_markdown(article).strip()
+    chunks = [f"**{article.title}**", _article_meta(article, timezone=timezone), body]
+    chunks.append(f"原文地址：[{article.canonical_url}]({article.canonical_url})")
+    return "\n\n".join(chunk for chunk in chunks if chunk)
 
 
 def _utf16_length(value: str) -> int:
     return len(value.encode("utf-16-le")) // 2
 
 
-def _visible_length(parts: list[dict[str, Any]]) -> int:
-    total = 0
-    for part in parts:
-        text = str(part.get("text", ""))
-        url = str(part.get("url", ""))
-        if part.get("type") == "text":
-            total += _utf16_length(text)
-        elif part.get("type") in {"image", "video"}:
+def _clip_markdown(value: str, limit: int, *, utf16: bool = False) -> str:
+    """Clip at complete Markdown block boundaries, with safe plain-text clipping.
+
+    Structured blocks (links, images, emphasis and code) are retained whole or
+    omitted. This avoids cutting a URL, fence or formatting span in half.
+    """
+    measure = _utf16_length if utf16 else len
+    if limit <= 0 or not value:
+        return ""
+    if measure(value) <= limit:
+        return value
+    suffix = "…"
+    lines = value.splitlines(keepends=True)
+    ranges: list[tuple[int, int]] = []
+    level = 0
+    for token in markdown_tokens(value):
+        mapping = token.map
+        if level == 0 and mapping and (token.nesting == 1 or token.type in {"fence", "code_block", "html_block", "hr"}):
+            start, end = int(mapping[0]), int(mapping[1])
+            if end > start and (not ranges or ranges[-1][:2] != (start, end)):
+                ranges.append((start, end))
+        level += token.nesting
+
+    if not ranges:
+        return ""
+    kept: list[str] = []
+    used = 0
+    for start, end in ranges:
+        block = "".join(lines[start:end])
+        block_size = measure(block)
+        if used + block_size <= limit:
+            kept.append(block)
+            used += block_size
             continue
-        elif url:
-            label = part.get("alt") or text or str(part.get("type", "media")).capitalize()
-            total += _utf16_length(f"[{label}]({url})")
-    return total
+        remaining = limit - used
+        body_budget = max(0, remaining - measure(suffix))
+        plain_prefix = _clip_plain_block(block, body_budget, measure)
+        if not plain_prefix:
+            plain_prefix = _clip_visible_prose(block, body_budget, measure)
+        if plain_prefix:
+            kept.append(plain_prefix.rstrip() + suffix)
+        elif remaining >= measure(suffix):
+            kept.append(suffix)
+        break
+    result = "".join(kept).rstrip()
+    if not result and limit >= measure(suffix):
+        return suffix
+    return result
 
 
-def _clip_utf16(value: str, limit: int) -> str:
+def _clip_plain_block(block: str, limit: int, measure) -> str:
+    """Return a source prefix only when markdown-it identifies plain text."""
     if limit <= 0:
         return ""
+    tokens = markdown_tokens(block)
+    inline_tokens = [token for token in tokens if token.type == "inline"]
+    if not inline_tokens:
+        return ""
+    if any(
+        child.type not in {"text", "softbreak", "hardbreak"}
+        for inline in inline_tokens
+        for child in (inline.children or [])
+    ):
+        return ""
+    result: list[str] = []
     used = 0
-    result = []
-    for character in value:
-        width = 2 if ord(character) > 0xFFFF else 1
+    for character in block:
+        width = measure(character)
         if used + width > limit:
             break
         result.append(character)
@@ -299,58 +118,100 @@ def _clip_utf16(value: str, limit: int) -> str:
     return "".join(result)
 
 
-def _truncate_blocks(blocks: list[ContentBlock], limit: int) -> list[ContentBlock]:
-    return truncate_content_blocks(blocks, limit)
+def _clip_visible_prose(block: str, limit: int, measure) -> str:
+    """Safely degrade a clipped structured block to tokenizer-derived prose."""
+    if limit <= 0:
+        return ""
+    pieces: list[str] = []
+    for token in markdown_tokens(block):
+        if token.type != "inline":
+            continue
+        for child in token.children or []:
+            if child.type in {"text", "softbreak", "hardbreak"}:
+                pieces.append(child.content if child.type == "text" else " ")
+            elif child.type == "image" and child.content:
+                pieces.append(child.content)
+            # Inline code and all URL destinations are deliberately omitted.
+    visible = "".join(pieces)
+    result: list[str] = []
+    used = 0
+    for character in visible:
+        width = measure(character)
+        if used + width > limit:
+            break
+        result.append(character)
+        used += width
+    return "".join(result)
 
 
-def _hard_fit_article(
-    article: Article, source_name: str, budget: int, send_as_media: bool = True, timezone: str = "Asia/Shanghai"
-) -> list[dict[str, Any]]:
-    heading = {"type": "text", "text": _article_heading(article, source_name, timezone)}
-    link = {"type": "text", "text": f"\n原文地址：[{article.canonical_url}]({article.canonical_url})"}
-    fixed = _utf16_length(heading["text"]) + _utf16_length(link["text"])
-    if fixed >= budget:
-        # Preserve source/title/link; if those alone exceed known transport limit,
-        # surface a rendering failure rather than silently lose the source URL.
-        minimal = (
-            f"{article.title}\n{_article_meta(article, source_name, timezone)}"
-            f"\n原文地址：[{article.canonical_url}]({article.canonical_url})"
-        )
-        if _utf16_length(minimal) > budget:
+class DefaultRenderer:
+    """Send normalized article Markdown as one plain component per article."""
+
+    def __init__(self, config: object | None = None) -> None:
+        self.config = config
+
+    async def render(
+        self,
+        articles: list[Article],
+        target: DeliveryTarget,
+        source_name: str,
+        is_list: bool = False,
+        batch_id: str = "",
+        **kwargs: object,
+    ) -> list[RenderedMessage]:
+        # Telegram's text limit is measured in UTF-16 units. Other adapters
+        # own their text limit and receive the original Markdown unchanged.
+        hard_limit = 4096 if "telegram" in target.platform.lower() else None
+        ordinary_truncate = not is_list and bool(getattr(self.config, "enable_content_truncation", False))
+        ordinary_length = int(getattr(self.config, "content_truncation_length", 0) or 0)
+        timezone = str(getattr(self.config, "timezone", "Asia/Shanghai") or "Asia/Shanghai")
+
+        messages: list[RenderedMessage] = []
+        current = ""
+        ids: list[str] = []
+        for original in articles:
+            article = clean_cached_article(original)
+            body = article_markdown(article).strip()
+            if ordinary_truncate and ordinary_length > 0:
+                body = _clip_markdown(body, ordinary_length)
+            text = _format_article(article, source_name, timezone, body)
+
+            if hard_limit and _utf16_length(text) > hard_limit:
+                text = _fit_article(article, source_name, timezone, body, hard_limit)
+            candidate = f"{current}\n\n{text}" if current else text
+            if hard_limit and ids and _utf16_length(candidate) > hard_limit:
+                messages.append(_message(current, ids, batch_id))
+                current, ids = "", []
+                candidate = text
+            if hard_limit and _utf16_length(candidate) > hard_limit:
+                candidate = _fit_article(article, source_name, timezone, body, hard_limit)
+            current = candidate
+            ids.append(article.article_id)
+
+        if ids:
+            messages.append(_message(current, ids, batch_id))
+        return messages
+
+
+def _format_article(article: Article, source_name: str, timezone: str, body: str) -> str:
+    chunks = [_article_heading(article, source_name, timezone), body]
+    chunks.append(f"原文地址：[{article.canonical_url}]({article.canonical_url})")
+    return "\n\n".join(chunk for chunk in chunks if chunk)
+
+
+def _fit_article(article: Article, source_name: str, timezone: str, body: str, limit: int) -> str:
+    header = _article_heading(article, source_name, timezone)
+    footer = f"原文地址：[{article.canonical_url}]({article.canonical_url})"
+    fixed = _utf16_length(header) + _utf16_length(footer) + 4
+    if fixed > limit:
+        minimal = f"{article.title}\n{_article_meta(article, source_name, timezone)}\n{footer}"
+        if _utf16_length(minimal) > limit:
             raise RenderingError("标题和原文链接超过平台硬限制")
-        return [{"type": "text", "text": minimal}]
-    remaining = max(0, budget - fixed)
-    pieces: list[dict[str, Any]] = [heading]
-    for block in article.content_blocks:
-        for part in _block_parts_many(block, send_as_media=send_as_media):
-            if part["type"] in {"image", "video"}:
-                pieces.append(part)
-                continue
-            if part["type"] == "text":
-                text = str(part.get("text", ""))
-                text_size = _utf16_length(text)
-                if text_size <= remaining:
-                    pieces.append(part)
-                    remaining -= text_size
-                    continue
-                if remaining and part.get("block_type") in {"text", "paragraph"} and not part.get("structured"):
-                    clipped = _clip_utf16(text, max(0, remaining - 1)).rstrip()
-                    if " " in clipped:
-                        clipped = clipped.rsplit(" ", 1)[0]
-                    if clipped:
-                        pieces.append({**part, "text": clipped + "…"})
-                remaining = 0
-                continue
-            # Other media types fall back to links and count toward the text cap.
-            url = str(part.get("url", ""))
-            label = str(part.get("alt") or part.get("text") or "媒体")
-            media_link = f"[{label}]({url})" if url else ""
-            media_size = _utf16_length(media_link)
-            if media_size <= remaining:
-                pieces.append({"type": "text", "text": media_link})
-                remaining -= media_size
-            else:
-                remaining = 0
-                break
-    pieces.append(link)
-    return pieces
+        return minimal
+    body_budget = max(0, limit - fixed)
+    clipped = _clip_markdown(body, body_budget, utf16=True)
+    return "\n\n".join(chunk for chunk in (header, clipped, footer) if chunk)
+
+
+def _message(text: str, article_ids: list[str], batch_id: str) -> RenderedMessage:
+    return RenderedMessage("default", "parts", {"parts": [{"type": "text", "text": text}]}, article_ids, batch_id)

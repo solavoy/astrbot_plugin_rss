@@ -228,7 +228,7 @@ class PluginConfig:
     request_retry_limit: int = 3
     enable_etag_cache: bool = True
     max_feed_response_bytes: int = 5_000_000
-    fetch_user_agent: str = "astrbot-plugin-rss/1.1.0"
+    fetch_user_agent: str = "astrbot-plugin-rss/1.2.0"
     enable_cloakbrowser: bool = False
     browser_allowed_domains: tuple[str, ...] = ()
     enable_cookie_persistence: bool = True

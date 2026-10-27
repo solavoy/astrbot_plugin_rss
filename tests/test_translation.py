@@ -7,6 +7,7 @@ import pytest
 from astrbot_plugin_rss.core.config import PluginConfig
 from astrbot_plugin_rss.core.models import Article, ContentBlock, RenderedMessage, now_ts
 from astrbot_plugin_rss.core.runtime import RSSRuntime
+from astrbot_plugin_rss.normalizers.markdown_content import blocks_to_markdown, markdown_tokens
 from astrbot_plugin_rss.services.management import ManagementService
 from astrbot_plugin_rss.services.translation import TranslationService
 
@@ -20,6 +21,7 @@ class TranslatingContext:
         " after image.": " 图片之后。",
         "First paragraph": "第一段",
         "Second paragraph": "第二段",
+        "continued paragraph": "继续段",
         "Original body": "原文正文",
     }
 
@@ -114,12 +116,211 @@ def _walk(blocks):
 
 
 def _plain_blocks(blocks):
+    if len(blocks) == 1 and blocks[0].type.lower() == "markdown":
+        tokens = markdown_tokens(blocks[0].text)
+        parts = []
+        for token in tokens:
+            if token.type == "inline":
+                parts.extend(child.content for child in token.children or [] if child.type in {"text", "code_inline"})
+            elif token.type in {"fence", "code_block"}:
+                parts.append(token.content)
+        return "".join(parts)
     values = []
     for block in _walk(blocks):
         if block.type.lower() in {"text", "paragraph", "heading", "quote", "link"}:
             if block.text:
                 values.append(block.text)
     return "".join(values)
+
+
+def _markdown(blocks):
+    if len(blocks) == 1 and blocks[0].type.lower() == "markdown":
+        return blocks[0].text
+    return blocks_to_markdown(blocks)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("include_original", [True, False])
+async def test_translation_preserves_nested_emphasis_links_and_inline_code(include_original):
+    source = Article(
+        "styled-article",
+        "feed-1",
+        "styled-entry",
+        "https://example.org/styled",
+        "A title",
+        content_blocks=[
+            ContentBlock(
+                "paragraph",
+                children=[
+                    ContentBlock("text", text="Read "),
+                    ContentBlock(
+                        "strong",
+                        children=[
+                            ContentBlock("text", text="First paragraph "),
+                            ContentBlock(
+                                "link",
+                                url="https://example.org/help?source=rss",
+                                children=[
+                                    ContentBlock("emphasis", children=[ContentBlock("text", text="the help page")])
+                                ],
+                            ),
+                            ContentBlock("text", text=" "),
+                            ContentBlock("inline_code", text="Original body **literal**"),
+                        ],
+                    ),
+                    ContentBlock("text", text=" now."),
+                ],
+            )
+        ],
+    )
+    original_blocks = [block.to_dict() for block in source.content_blocks]
+
+    outcome = await TranslationService(TranslatingContext(), "provider-one").translate_article(
+        source, include_original=include_original
+    )
+
+    assert outcome.succeeded is True
+    assert [block.to_dict() for block in source.content_blocks] == original_blocks
+    markdown = _markdown(outcome.article.content_blocks)
+    assert len(outcome.article.content_blocks) == 1
+    assert "第一段" in markdown
+    assert "帮助页面" in markdown
+    assert "**第一段" in markdown
+    assert "https://example.org/help?source=rss" in markdown
+    assert markdown.count("https://example.org/help?source=rss") == 1
+    assert "Original body **literal**" in markdown
+    assert markdown.count("Original body **literal**") == 1
+    assert "[[RSS_" not in markdown
+
+
+@pytest.mark.asyncio
+async def test_markdown_translation_pairs_paragraphs_without_duplicate_resources_or_code():
+    video_url = "https://cdn.example.org/video.mp4"
+    image_url = "https://cdn.example.org/photo.png"
+    source = Article(
+        "markdown-resources",
+        "feed-1",
+        "markdown-resources-entry",
+        "https://example.org/markdown",
+        "A title",
+        content_blocks=[
+            ContentBlock(
+                "markdown",
+                text=(
+                    f"First paragraph with **First paragraph** `**literal**` [watch]({video_url}) "
+                    f"![photo]({image_url})\n\nSecond paragraph"
+                ),
+            )
+        ],
+    )
+    source_hash = source.content_hash
+    context = TranslatingContext()
+
+    outcome = await TranslationService(context, "provider-one").translate_article(source, include_original=True)
+
+    assert outcome.succeeded is True
+    markdown = _markdown(outcome.article.content_blocks)
+    assert markdown.index("First paragraph") < markdown.index("第一段")
+    assert markdown.index("Second paragraph") < markdown.index("第二段")
+    assert markdown.count(video_url) == 1
+    assert markdown.count(image_url) == 1
+    assert markdown.index(video_url) < markdown.index(image_url) < markdown.index("Second paragraph")
+    assert markdown.count("`**literal**`") == 1
+    assert "**第一段**" in markdown
+    assert "[[RSS_" not in markdown
+    assert source.content_hash == source_hash
+    assert source.content_blocks[0].text.startswith("First paragraph with **First paragraph**")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("include_original", [True, False])
+@pytest.mark.parametrize(
+    ("markdown", "expected_structure", "expected_translations"),
+    [
+        ("> First paragraph\n> Second paragraph", "blockquote_open", ("第一段", "第二段")),
+        (
+            "- First paragraph\n  continued paragraph",
+            "list_item_open",
+            ("第一段", "继续段"),
+        ),
+    ],
+)
+async def test_multiline_markdown_translation_maps_quote_and_list_source_spans(
+    include_original, markdown, expected_structure, expected_translations
+):
+    context = TranslatingContext()
+    source = Article(
+        "multiline-markdown",
+        "feed-1",
+        "multiline-markdown-entry",
+        "https://example.org/multiline",
+        "A title",
+        content_blocks=[ContentBlock("markdown", text=markdown)],
+    )
+
+    outcome = await TranslationService(context, "provider-one").translate_article(
+        source, include_original=include_original
+    )
+
+    assert context.calls
+    assert outcome.succeeded is True
+    result = _markdown(outcome.article.content_blocks)
+    tokens = markdown_tokens(result)
+    assert any(token.type == expected_structure for token in tokens)
+    assert all(value in result for value in expected_translations)
+    if include_original:
+        assert "First paragraph" in result
+        if expected_structure == "blockquote_open":
+            assert "Second paragraph" in result
+        else:
+            assert "continued paragraph" in result
+    else:
+        assert "First paragraph" not in result
+        assert "Second paragraph" not in result
+        assert "continued paragraph" not in result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("damage", ["missing", "duplicate", "reordered"])
+async def test_invalid_formatting_markers_fall_back_to_unmodified_article(damage):
+    def damage_markers(prompt, section):
+        output = []
+        for match in section.finditer(prompt):
+            text = match.group(2).replace("First paragraph", "第一段")
+            pair = re.findall(r"\[\[RSS_[^\]]+_F\d+_(?:BEGIN|END)\]\]", text)
+            if pair:
+                if damage == "missing":
+                    text = text.replace(pair[0], "")
+                elif damage == "duplicate":
+                    text = text.replace(pair[0], pair[0] * 2)
+                else:
+                    text = (
+                        text.replace(pair[0], "TEMP_MARKER").replace(pair[1], pair[0]).replace("TEMP_MARKER", pair[1])
+                    )
+            output.append(f"{match.group(1)}\n{text}\n{match.group(3)}")
+        return "\n".join(output)
+
+    source = Article(
+        "styled-fallback",
+        "feed-1",
+        "styled-fallback-entry",
+        "https://example.org/styled",
+        "A title",
+        content_blocks=[
+            ContentBlock(
+                "paragraph",
+                children=[ContentBlock("strong", children=[ContentBlock("text", text="First paragraph")])],
+            )
+        ],
+    )
+
+    outcome = await TranslationService(
+        TranslatingContext(completion_transform=damage_markers), "provider-one"
+    ).translate_article(source, include_original=False)
+
+    assert outcome.succeeded is False
+    assert outcome.article is source
+    assert source.content_blocks[0].children[0].children[0].text == "First paragraph"
 
 
 @pytest.mark.asyncio
@@ -186,16 +387,10 @@ async def test_translation_uses_selected_provider_and_pairs_paragraphs_without_m
     assert "A title" in context.calls[0][1]
     assert outcome.article is not source
     assert outcome.article.title == "A title\n一则标题"
-    wrapper = outcome.article.content_blocks[0]
-    assert [_plain_blocks([child]) for child in wrapper.children[:4]] == [
-        "First paragraph",
-        "第一段",
-        "Second paragraph",
-        "第二段",
-    ]
-    assert [block.url for block in _walk(outcome.article.content_blocks) if block.type == "video"] == [
-        "https://cdn.example.org/video.mp4"
-    ]
+    body = _markdown(outcome.article.content_blocks)
+    assert body.index("First paragraph") < body.index("第一段")
+    assert body.index("Second paragraph") < body.index("第二段")
+    assert body.count("https://cdn.example.org/video.mp4") == 1
     assert source.title == "A title"
     assert source.content_hash == source_hash
     assert [child.text for child in source.content_blocks[0].children[:2]] == ["First paragraph", "Second paragraph"]
@@ -210,15 +405,13 @@ async def test_include_original_false_translates_link_label_and_keeps_target_and
 
     assert outcome.succeeded is True
     assert outcome.article.title == "一则标题"
-    paragraph = outcome.article.content_blocks[0]
     assert len(outcome.article.content_blocks) == 1
-    assert "Read " not in _plain_blocks(outcome.article.content_blocks)
-    assert "the help page" not in _plain_blocks(outcome.article.content_blocks)
-    links = [block for block in _walk(outcome.article.content_blocks) if block.type == "link"]
-    assert [(link.url, link.text) for link in links] == [("https://example.org/help?source=rss", "帮助页面")]
-    images = [block for block in _walk(outcome.article.content_blocks) if block.type == "image"]
-    assert [image.url for image in images] == ["https://cdn.example.org/image.png"]
-    assert _plain_blocks([paragraph]) == "阅读帮助页面 现在。 图片之后。"
+    markdown = _markdown(outcome.article.content_blocks)
+    assert "Read " not in markdown
+    assert "the help page" not in markdown
+    assert "[帮助页面](<https://example.org/help?source=rss>)" in markdown
+    assert "![photo](<https://cdn.example.org/image.png>)" in markdown
+    assert _plain_blocks(outcome.article.content_blocks) == "阅读帮助页面 现在。 图片之后。"
 
 
 @pytest.mark.asyncio
@@ -237,6 +430,53 @@ async def test_title_urls_are_protected_and_restored_instead_of_leaking_markers(
     assert outcome.succeeded is True
     assert outcome.article.title == "一则标题 https://example.org/source"
     assert "[[RSS_" not in outcome.article.title
+
+
+@pytest.mark.asyncio
+async def test_title_is_plain_text_and_keeps_literal_markdown_characters():
+    source = Article(
+        "article-plain-title",
+        "feed-1",
+        "entry-plain-title",
+        "https://example.org/article",
+        "A title **literal** https://example.org/source",
+        content_blocks=[ContentBlock("markdown", text="Original body")],
+    )
+
+    outcome = await TranslationService(TranslatingContext(), "provider-one").translate_article(
+        source, include_original=False
+    )
+
+    assert outcome.succeeded is True
+    assert outcome.article.title == "一则标题 **literal** https://example.org/source"
+
+
+@pytest.mark.asyncio
+async def test_translated_plain_markdown_punctuation_stays_literal_after_token_text_decoding():
+    source = Article(
+        "article-markdown-literals",
+        "feed-1",
+        "entry-markdown-literals",
+        "https://example.org/article",
+        "A title",
+        content_blocks=[
+            ContentBlock("markdown", text=r"Price \*literal\* and \[brackets\] plus \| label. First paragraph")
+        ],
+    )
+
+    outcome = await TranslationService(TranslatingContext(), "provider-one").translate_article(
+        source, include_original=False
+    )
+
+    assert outcome.succeeded is True
+    markdown = _markdown(outcome.article.content_blocks)
+    assert r"\*literal\*" in markdown
+    assert r"\[brackets\]" in markdown
+    assert r"\|" in markdown
+    assert "第一段" in markdown
+    tokens = markdown_tokens(markdown)
+    inline = [child for token in tokens if token.type == "inline" for child in token.children or []]
+    assert not any(token.type in {"link_open", "strong_open", "em_open"} for token in inline)
 
 
 @pytest.mark.asyncio
@@ -352,7 +592,7 @@ async def test_skip_keeps_target_language_title_and_resource_paragraph_once(incl
 
     assert outcome.succeeded is True
     assert outcome.article.title == "Bonjour"
-    assert outcome.article.content_blocks == source.content_blocks
+    assert _markdown(outcome.article.content_blocks) == blocks_to_markdown(source.content_blocks)
     assert "Translate into French" in context.calls[0][2]
     assert "简体中文" not in context.calls[0][2]
     skip_markers = re.findall(r"\[\[RSS_[0-9a-f]{32}_U\d+_SKIP\]\]", context.calls[0][1])
@@ -459,7 +699,7 @@ async def test_exact_source_response_is_treated_as_skip_even_when_original_is_hi
 
     assert outcome.succeeded is True
     assert outcome.article.title == "Already English"
-    assert outcome.article.content_blocks == source.content_blocks
+    assert _markdown(outcome.article.content_blocks) == blocks_to_markdown(source.content_blocks)
 
 
 @pytest.mark.asyncio
@@ -546,9 +786,9 @@ async def test_cached_media_cleanup_prevents_view_video_label_from_being_transla
 
     assert outcome.succeeded is True
     assert "View video" not in context.calls[0][1]
-    videos = [block for block in _walk(outcome.article.content_blocks) if block.type == "video"]
-    assert [video.url for video in videos] == [video_url]
-    assert not [block for block in _walk(outcome.article.content_blocks) if block.type == "link"]
+    markdown = _markdown(outcome.article.content_blocks)
+    assert markdown.count(video_url) == 1
+    assert "View video" not in markdown
 
 
 @pytest.mark.asyncio
@@ -586,18 +826,13 @@ async def test_list_item_and_table_cell_translation_preserve_container_counts():
     outcome = await TranslationService(context, "provider-one").translate_article(source, include_original=True)
 
     assert outcome.succeeded is True
-    list_block, table_block = outcome.article.content_blocks
-    assert len(list_block.children) == 2
-    assert [child.type for child in list_block.children] == ["list_item", "list_item"]
-    assert [_plain_blocks([child]) for child in list_block.children] == [
-        "First paragraph\n第一段",
-        "Second paragraph\n第二段",
-    ]
-    assert len(table_block.children[0].children) == 2
-    assert [_plain_blocks([cell]) for cell in table_block.children[0].children] == [
-        "First paragraph\n第一段",
-        "Second paragraph\n第二段",
-    ]
+    markdown = _markdown(outcome.article.content_blocks)
+    tokens = markdown_tokens(markdown)
+    assert sum(token.type == "list_item_open" for token in tokens) == 2
+    assert markdown.count("第一段") == 2
+    assert markdown.count("第二段") == 2
+    assert "| First paragraph | Second paragraph |" in markdown
+    assert r"\| 第一段 \| 第二段 \|" in markdown
 
 
 @pytest.mark.asyncio

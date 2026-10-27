@@ -2,8 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Protocol
 
-from ..normalizers.discourse import strip_discourse_footer
-from ..normalizers.html_content import normalize_html
+from ..normalizers.markdown_content import clean_markdown, html_to_markdown
 
 
 class SourceAdapter(Protocol):
@@ -47,8 +46,8 @@ class DiscourseAdapter(GenericAdapter):
                 )
                 if not has_read_label or not has_stats_terms:
                     continue
-                blocks = normalize_html(text, canonical)
-                if strip_discourse_footer(blocks, canonical) is not blocks:
+                markdown = html_to_markdown(text, canonical)
+                if clean_markdown(markdown, canonical, is_discourse=True) != markdown:
                     return True
         return False
 

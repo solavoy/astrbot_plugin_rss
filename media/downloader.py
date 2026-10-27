@@ -174,7 +174,7 @@ class MediaDownloader:
                 path,
                 headers={
                     "Host": parsed.netloc,
-                    "User-Agent": "astrbot-plugin-rss/1.1.0",
+                    "User-Agent": "astrbot-plugin-rss/1.2.0",
                     "Accept": "image/*,video/*,audio/*,application/pdf,*/*;q=0.1",
                 },
             )

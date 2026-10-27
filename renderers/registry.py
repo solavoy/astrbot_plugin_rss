@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any
 
 from ..core.errors import PlatformUnsupportedError, RenderingError
 from ..core.models import Article, DeliveryTarget, RenderedMessage
 from ..media import FeishuMediaUploader, MediaDownloader
-from ..normalizers.discourse import clean_cached_article
+from ..normalizers.markdown_content import article_media
 from ..normalizers.media_content import is_pure_video_article
 from .default import DefaultRenderer
 from .feishu import FeishuRenderer
@@ -73,17 +74,33 @@ class RendererRegistry:
                 send_as_media = bool(getattr(self.config, "send_as_media", True))
                 default_enabled = bool(getattr(self.config, "enable_default_renderer", True))
                 for original in articles:
-                    article = clean_cached_article(original)
-                    if send_as_media and default_enabled and is_pure_video_article(article):
+                    if send_as_media and default_enabled and is_pure_video_article(original):
+                        media = [item for item in article_media(original) if item.type.lower() == "video" and item.url]
+                        text_metadata = {
+                            key: value
+                            for key, value in original.metadata.items()
+                            if key not in {"media", "attachments"}
+                        }
+                        text_only = replace(original, content_blocks=[], metadata=text_metadata)
                         messages.extend(
                             await self.default.render(
-                                [article], target, source_name, is_list=is_list, batch_id=batch_id, **kwargs
+                                [text_only], target, source_name, is_list=is_list, batch_id=batch_id, **kwargs
                             )
+                        )
+                        messages.extend(
+                            RenderedMessage(
+                                "default",
+                                "video",
+                                {"url": item.url, "alt": item.attrs.get("alt") or item.attrs.get("title") or ""},
+                                [original.article_id],
+                                batch_id,
+                            )
+                            for item in media
                         )
                     else:
                         messages.extend(
                             await renderer.render(
-                                [article], target, source_name, is_list=is_list, batch_id=batch_id, **kwargs
+                                [original], target, source_name, is_list=is_list, batch_id=batch_id, **kwargs
                             )
                         )
                 return messages

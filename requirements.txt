@@ -1,6 +1,8 @@
 aiosqlite>=0.20
-beautifulsoup4>=4.12
 curl_cffi>=0.16.3,<0.17
+emoji>=2.14,<3
 feedparser>=6.0
+markdown-it-py>=3,<5
+markdownify>=1.2,<2
 Pillow>=10.0
 tzdata>=2024.1

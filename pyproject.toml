@@ -1,8 +1,8 @@
 [project]
 name = "astrbot-plugin-rss"
-version = "1.1.0"
+version = "1.2.0"
 requires-python = ">=3.12"
-dependencies = ["aiosqlite>=0.20", "beautifulsoup4>=4.12", "curl_cffi>=0.16.3,<0.17", "feedparser>=6.0", "Pillow>=10.0", "tzdata>=2024.1"]
+dependencies = ["aiosqlite>=0.20", "curl_cffi>=0.16.3,<0.17", "emoji>=2.14,<3", "feedparser>=6.0", "markdown-it-py>=3,<5", "markdownify>=1.2,<2", "Pillow>=10.0", "tzdata>=2024.1"]
 
 [project.optional-dependencies]
 browser = ["cloakbrowser>=0.6.2,<0.7"]

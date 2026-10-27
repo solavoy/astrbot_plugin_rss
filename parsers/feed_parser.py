@@ -4,6 +4,7 @@ import calendar
 import datetime
 import email.utils
 import hashlib
+import html
 import xml.etree.ElementTree as ET
 import xml.parsers.expat
 from typing import Any
@@ -12,9 +13,8 @@ from urllib.parse import urljoin, urlsplit
 import feedparser
 
 from ..core.models import Article, ContentBlock, FetchResult, ParsedFeed
-from ..normalizers import normalize_html
-from ..normalizers.discourse import normalize_image_links, strip_discourse_footer, strip_discourse_heading_anchors
-from ..normalizers.media_content import associate_media_thumbnails, media_kind, normalize_media_content_blocks
+from ..normalizers.markdown_content import clean_markdown, html_to_markdown
+from ..normalizers.media_content import associate_media_thumbnails
 from .adapters import DEFAULT_ADAPTERS, SourceAdapter
 
 
@@ -50,9 +50,24 @@ def _clean_link(value: Any, base_url: str) -> str:
         return base_url
     try:
         resolved = urljoin(base_url, value)
-        return resolved if urlsplit(resolved).scheme.lower() in {"http", "https"} else ""
+        parsed = urlsplit(resolved)
+        if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+            return ""
+        if parsed.username or parsed.password:
+            return ""
+        _ = parsed.port
+        return resolved
     except ValueError:
         return ""
+
+
+def _dimension(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(str(value).strip().removesuffix("px"))
+    except (TypeError, ValueError):
+        return None
 
 
 def _nested_media_thumbnails(data: bytes) -> list[list[tuple[str, str]]]:
@@ -155,11 +170,6 @@ class FeedParser:
                     f"{title}\0{entry.get('published', '')}\0{link}\0{body_seed}".encode()
                 ).hexdigest()
             author = str(entry.get("author") or entry.get("dc_creator") or entry.get("creator") or "")
-            blocks = self._content_blocks(entry, link)
-            if adapter.name == "discourse":
-                blocks = normalize_image_links(blocks)
-                blocks = strip_discourse_footer(blocks, link)
-            blocks = strip_discourse_heading_anchors(blocks, link, is_discourse=adapter.name == "discourse")
             categories = [str(tag.get("term") or tag.get("label") or "") for tag in entry.get("tags", [])]
             categories = [category for category in categories if category]
             attachments = []
@@ -167,26 +177,25 @@ class FeedParser:
             for item in entry.get("media_content", []) or []:
                 media_url = _clean_link(item.get("url"), link)
                 if media_url:
-                    media_items.append(
-                        {
-                            "url": media_url,
-                            "type": item.get("type", ""),
-                            "medium": item.get("medium", ""),
-                            "width": item.get("width"),
-                            "height": item.get("height"),
-                        }
-                    )
+                    normalized = {
+                        "url": media_url,
+                        "type": item.get("type", ""),
+                        "medium": item.get("medium", ""),
+                    }
+                    for dimension in ("width", "height"):
+                        value = _dimension(item.get(dimension))
+                        if value is not None:
+                            normalized[dimension] = value
+                    media_items.append(normalized)
             for thumb in entry.get("media_thumbnail", []) or []:
                 thumb_url = _clean_link(thumb.get("url"), link)
                 if thumb_url:
-                    media_items.append(
-                        {
-                            "url": thumb_url,
-                            "role": "thumbnail",
-                            "width": thumb.get("width"),
-                            "height": thumb.get("height"),
-                        }
-                    )
+                    normalized = {"url": thumb_url, "role": "thumbnail"}
+                    for dimension in ("width", "height"):
+                        value = _dimension(thumb.get(dimension))
+                        if value is not None:
+                            normalized[dimension] = value
+                    media_items.append(normalized)
             nested_relations = [
                 (_clean_link(original, link), _clean_link(thumbnail, link))
                 for original, thumbnail in (media_relations[entry_index] if entry_index < len(media_relations) else [])
@@ -197,28 +206,24 @@ class FeedParser:
                 nested_relations,
                 allow_single_pair_fallback=not nested_relations,
             )
-            for item in media_items:
-                media_url = str(item.get("url") or "")
-                if not media_url:
-                    continue
-                if item.get("role") == "thumbnail":
-                    blocks.append(ContentBlock("image", url=media_url, attrs=item))
-                else:
-                    blocks.append(
-                        ContentBlock(
-                            media_kind(item) or "attachment",
-                            url=media_url,
-                            attrs=item,
-                        )
-                    )
             for enclosure in entry.get("enclosures", []):
                 href = _clean_link(enclosure.get("href"), link)
                 if href and href != link:
                     attachments.append(
-                        {"url": href, "type": enclosure.get("type", ""), "length": enclosure.get("length")}
+                        {
+                            "url": href,
+                            "type": enclosure.get("type", ""),
+                            "length": enclosure.get("length"),
+                            "role": "attachment",
+                        }
                     )
-                    blocks.append(ContentBlock("attachment", url=href, attrs=attachments[-1]))
-            blocks = normalize_media_content_blocks(blocks, media_items)
+            markdown = self._content_markdown(
+                entry,
+                link,
+                media_items,
+                attachments=attachments,
+                is_discourse=adapter.name == "discourse",
+            )
             metadata = {
                 "source_adapter": adapter.name,
                 "feed_title": feed_title,
@@ -243,7 +248,7 @@ class FeedParser:
                     ),
                     updated_at=_date(entry.get("updated_parsed") or entry.get("updated")),
                     categories=categories,
-                    content_blocks=blocks,
+                    content_blocks=[ContentBlock("markdown", text=markdown)],
                     metadata=metadata,
                 )
             )
@@ -258,7 +263,14 @@ class FeedParser:
         return ParsedFeed(feed_title, feed_description, articles, metadata)
 
     @staticmethod
-    def _content_blocks(entry: Any, base_url: str):
+    def _content_markdown(
+        entry: Any,
+        base_url: str,
+        media: list[dict],
+        *,
+        attachments: list[dict] | None = None,
+        is_discourse: bool = False,
+    ) -> str:
         candidates = []
         # Prefer Atom content / content:encoded, then summary, then description.
         for content in entry.get("content", []) or []:
@@ -266,12 +278,30 @@ class FeedParser:
         for key in ("summary", "description"):
             if entry.get(key):
                 candidates.append((entry.get(key), entry.get(f"{key}_type", "html")))
+        conversion_errors = []
         for value, content_type in candidates:
             if value:
-                if "html" in str(content_type).lower() or "xhtml" in str(content_type).lower() or "<" in str(value):
-                    return normalize_html(str(value), base_url)
-                return normalize_html(
-                    "<p>" + str(value).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;") + "</p>",
-                    base_url,
-                )
-        return []
+                candidate_media: list[dict] = []
+                try:
+                    if "html" in str(content_type).lower() or "xhtml" in str(content_type).lower() or "<" in str(value):
+                        markdown = html_to_markdown(
+                            str(value), base_url, media=candidate_media, is_discourse=is_discourse
+                        )
+                    else:
+                        escaped = html.escape(str(value), quote=False)
+                        markdown = html_to_markdown(
+                            f"<p>{escaped}</p>", base_url, media=candidate_media, is_discourse=is_discourse
+                        )
+                    media.extend(candidate_media)
+                    return clean_markdown(
+                        markdown,
+                        base_url,
+                        is_discourse=is_discourse,
+                        media=media,
+                        attachments=attachments or [],
+                    )
+                except ValueError as exc:
+                    conversion_errors.append(str(exc))
+        if conversion_errors:
+            raise FeedParseError(f"could not convert feed HTML: {conversion_errors[0]}")
+        return ""

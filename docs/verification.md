@@ -23,18 +23,22 @@ git diff --check
 
 抓取间隔回归覆盖 `d`、`h`、`m`、`s` 换算、大小写与空白、无单位默认秒、旧整数配置及迁移优先级、源和列表的零值继承，以及非法输入拒绝。服务、管理 API 和 JSON 导入统一按秒存储，导入验证失败不会产生部分写入。WebUI 通过 Node VM 检查解析边界及源保存、列表创建和列表保存三个入口的提交与非法输入阻断。
 
+1.1.1 补充宿主配置保存类型校验：旧整数转为数字字符串，`1h`、无单位数字与含空白的大小写单位输入在保存、重载后保持原文，迁移幂等；运行时才转换为秒。源和列表的 `poll_interval_input` 与秒值同事务保存，详情、目录、重启、JSON 导入导出及备份恢复保持原始填写值，错误或过期展示元数据不会覆盖调度秒值。
+
+Feed HTML 用户样本在解析阶段转换成 Markdown，缓存与存储只保留一个 Markdown 内容块。Markdown token 回归检查标题、段落、嵌套强调、链接、表格降级、内联/代码块字面内容、媒体位置和旧块缓存兼容。Telegraph 回归检查只输出官方允许的节点和 `href`/`src` 属性、安全 HTTP(S) 地址、粗体后紧邻中文的排版、媒体顺序、64 KiB 截断仍保留有效节点及原文链接。AI 翻译通过 Markdown 标记保护、原文/译文段落配对、链接/媒体资源只出现一次、代码中的 `**` 字面内容、损坏标记回退和源文章不突变回归。
+
 ## 本地集成核对
 
 本地集成测试使用 fake AI/provider 和文章数据，确认配置提示词作为模型系统提示，RSS 标题和正文作为独立用户输入；默认目标语言为 `[简体中文]`，替换为 `[英语]` 后目标随之改变。已是目标语言的标题或段落只保留一次；不同提示词使用独立缓存，相同提示词可复用缓存。测试未调用真实 AI 服务。
 
-集成测试确认启用 `media.send_as_media` 时，图文进入原有渠道渲染，纯视频交给 AstrBot 默认 `Video.fromURL` 组件并由适配器下载发送；关闭时显示链接且不触发插件媒体下载。飞书卡片复用 AstrBot 已配置的 Lark client，图文重复链接和关联缩略图会清理。此处使用本地 fake/桩接口，没有发送真实平台消息。
+集成测试确认默认渠道与 Telegram 直接渲染 Markdown；Feishu 图文卡片复用 AstrBot 已配置的 Lark client，上传图片/视频并清理重复链接与关联缩略图。Feishu 纯视频走 AstrBot URL-based Video operation，由适配器下载发送；关闭 `media.send_as_media` 时使用源链接并跳过插件媒体下载。此处使用本地 fake/桩接口，没有发送真实平台消息。
 
 Linux.do 的标题锚点经解析和旧缓存清理后，在默认渲染、飞书渲染和 Telegraph 节点中均不再输出锚点 URL 或 `¶`，标题文本及正常站内/跨站链接保留；缓存清理不修改原文章对象或其 hash。检查使用本地数据和桩接口。
 
-## 当前最终结果
+## 1.2.0 最终结果
 
-2026-10-22 全量检查为 `401 passed, 7 warnings`。其中 6 条为 Windows Proactor/curl_cffi selector 提示，1 条为 feedparser 弃用提示。`ruff check .` 通过，`ruff format --check .` 确认 91 个文件已格式化，`node --check views/rss/app.js` 与 `git diff --check` 通过。
+2026-10-27，1.2.0 全量检查为 `450 passed, 9 warnings`（18.03 秒）。其中 6 条为 Windows curl selector 提示，3 条为 feedparser 弃用提示（`updated_parsed` 2 条、`updated` 1 条）。全仓 `ruff check`、`ruff format --check`（93 个文件）、`node --check views/rss/app.js` 和 `git diff --check` 均通过；diff 检查只有 CRLF 警告。
 
 ## 尚未覆盖的真实环境
 
-当前记录不代表已在真实 AstrBot 实例、AI 提供商或飞书应用上完成端到端验收。未使用真实平台凭据，也未发送真实消息；适配器版本差异、实际权限、网络与平台侧媒体限制仍需在目标部署环境验证。默认 AstrBot URL 视频组件由宿主适配器负责下载上传，本插件的媒体下载器大小限制不适用于该默认视频路径。
+当前记录不代表已在真实 AstrBot 实例、AI 提供商或飞书应用上完成端到端验收。未使用真实平台凭据，也未发送真实消息；适配器版本差异、实际权限、网络与平台侧媒体限制仍需在目标部署环境验证。Feishu 纯视频 URL operation 由宿主适配器负责下载上传，本插件的媒体下载器大小限制不适用于该路径。
