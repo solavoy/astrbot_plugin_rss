@@ -117,8 +117,10 @@ function App() {
             const match = /^([0-9]+)[ \t\r\n\f\v]*([dhms]?)$/i.exec(text);
             if (!match)
                 return undefined;
-            return /^0+$/.test(match[1]) ? null : text;
+            return String(value);
         },
+        intervalInput(row) { return row?.poll_interval_input ?? String(row?.poll_interval || 0); },
+        intervalLabel(row) { return this.intervalInput(row) + (row?.poll_interval ? '' : '（继承全局）'); },
         async get(ep, params) {
             return await this.bridge.apiGet(ep, params || {});
         },
@@ -148,7 +150,7 @@ function App() {
                             this.setTimezone(d);
                             this.feedEnabled = !!d.feed?.enabled;
                             this.feedTranslationEnabled = !!d.feed?.translation_enabled;
-                            this.feedInterval = d.feed?.poll_interval == null || d.feed.poll_interval === 0 ? '0' : String(d.feed.poll_interval);
+                            this.feedInterval = this.intervalInput(d.feed);
                         }
                     }
                     else {
@@ -170,7 +172,7 @@ function App() {
                             this.setTimezone(d);
                             this.editListName = d.list?.name || '';
                             this.editListDescription = d.list?.description || '';
-                            this.editListInterval = d.list?.poll_interval == null || d.list.poll_interval === 0 ? '0' : String(d.list.poll_interval);
+                            this.editListInterval = this.intervalInput(d.list);
                             this.editListEnabled = !!d.list?.enabled;
                             this.feedChoices = choices.items || [];
                         }

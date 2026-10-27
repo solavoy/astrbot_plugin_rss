@@ -100,6 +100,8 @@ def test_command_handlers_are_owned_by_plugin_main_module(monkeypatch):
         saved = 0
 
         def save_config(self):
+            # Match the host schema check before saving a dashboard update.
+            assert isinstance(self["fetch"]["global_poll_interval"], str)
             self.saved += 1
 
     plugin_config = Config(
@@ -113,7 +115,7 @@ def test_command_handlers_are_owned_by_plugin_main_module(monkeypatch):
     )
     plugin = main.RSSPlugin(types.SimpleNamespace(), plugin_config)
     assert plugin._rss_config is plugin_config
-    assert plugin_config["fetch"] == {"global_poll_interval": 90, "request_timeout": 20}
+    assert plugin_config["fetch"] == {"global_poll_interval": "90", "request_timeout": 20}
     assert plugin_config["network"]["proxy"] == "http://proxy.example:8080"
     assert plugin_config["telegram"]["telegraph_access_token"] == "legacy-token"
     assert plugin_config["global_poll_interval"] == 0
@@ -123,6 +125,23 @@ def test_command_handlers_are_owned_by_plugin_main_module(monkeypatch):
     assert plugin_config.saved == 1
     main.RSSPlugin(types.SimpleNamespace(), plugin_config)
     assert plugin_config.saved == 1
+
+    from astrbot_plugin_rss.core.config import PluginConfig
+
+    dashboard_config = Config(fetch={"global_poll_interval": 3600, "request_timeout": 15})
+    main.RSSPlugin(types.SimpleNamespace(), dashboard_config)
+    assert dashboard_config["fetch"]["global_poll_interval"] == "3600"
+    assert dashboard_config.saved == 1
+    for entered_text, seconds in (("3600", 3600), ("1h", 3600), (" 2 H ", 7200)):
+        # The host's string text field emits its raw text to the config model.
+        dashboard_config["fetch"]["global_poll_interval"] = entered_text
+        dashboard_config.save_config()
+        saved_count = dashboard_config.saved
+        main.RSSPlugin(types.SimpleNamespace(), dashboard_config)
+        assert dashboard_config.saved == saved_count
+        assert dashboard_config["fetch"]["global_poll_interval"] == entered_text
+        assert PluginConfig.from_mapping(dashboard_config).global_poll_interval == seconds
+        assert dashboard_config["fetch"]["global_poll_interval"] == entered_text
 
     from astrbot_plugin_rss.commands.rss import RSSCommands
 

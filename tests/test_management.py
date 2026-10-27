@@ -8,6 +8,83 @@ from astrbot_plugin_rss.core.runtime import RSSRuntime
 from astrbot_plugin_rss.services.management import ManagementService
 
 
+@pytest.mark.parametrize(
+    ("raw", "seconds"), [("1h", 3600), ("3600", 3600), ("0h", None), (" 2 H ", 7200), (3600, 3600)]
+)
+def test_interval_input_survives_reload_restart_and_backup(tmp_path, raw, seconds):
+    async def run():
+        runtime = RSSRuntime({}, tmp_path / "data")
+        await runtime.initialize()
+        service = ManagementService(runtime)
+        try:
+            feed = await runtime.repository.create_feed("https://example.org/interval-display")
+            changed = await service.post(f"feeds/{feed.public_id}/update", {"poll_interval": raw})
+            assert changed["poll_interval"] == seconds
+            assert changed["poll_interval_input"] == str(raw)
+            created = await service.post("lists/create", {"name": "Display", "poll_interval": raw})
+            list_id = created["list_id"]
+            assert created["poll_interval_input"] == str(raw)
+
+            async def check_display():
+                for endpoint, entity in ((f"feeds/{feed.public_id}", "feed"), (f"lists/{list_id}", "list")):
+                    detail = (await service.get(endpoint, {}))[entity]
+                    assert detail["poll_interval"] == seconds
+                    assert detail["poll_interval_input"] == str(raw)
+                for endpoint in ("feeds", "lists"):
+                    row = (await service.get(endpoint, {}))["items"][0]
+                    assert row["poll_interval"] == seconds
+                    assert row["poll_interval_input"] == str(raw)
+
+            await service.post(f"feeds/{feed.public_id}/update", {"translation_enabled": True})
+            await service.post(f"lists/{list_id}/update", {"description": "Preserve input"})
+            await check_display()
+            await runtime.close()
+            runtime = RSSRuntime({}, tmp_path / "data")
+            await runtime.initialize()
+            service = ManagementService(runtime)
+            await check_display()
+
+            backup = tmp_path / "with-inputs.sqlite3"
+            await runtime.backup(backup)
+            await service.post(f"feeds/{feed.public_id}/update", {"poll_interval": "2s"})
+            await service.post(f"lists/{list_id}/update", {"poll_interval": "2s"})
+            await service._restore_sqlite(backup)
+            await check_display()
+        finally:
+            await service.runtime.close()
+
+    asyncio.run(run())
+
+
+def test_interval_display_falls_back_and_invalid_metadata_write_rolls_back(tmp_path):
+    async def run():
+        runtime = RSSRuntime({}, tmp_path)
+        await runtime.initialize()
+        try:
+            feed = await runtime.repository.create_feed(
+                "https://example.org/stale-interval", poll_interval=3600, poll_interval_input="1h"
+            )
+            service = ManagementService(runtime)
+            async with runtime.database.transaction() as conn:
+                await conn.execute("UPDATE feeds SET poll_interval=60 WHERE feed_id=?", (feed.feed_id,))
+            detail = await service.get(f"feeds/{feed.public_id}", {})
+            assert detail["feed"]["poll_interval_input"] == "60"
+            with pytest.raises(ValueError, match="must match"):
+                await runtime.repository.update_feed(feed.feed_id, poll_interval=120, poll_interval_input="1h")
+            assert (await runtime.repository.get_feed(feed.feed_id)).poll_interval == 60
+            await runtime.repository.set_setting(f"poll_interval_input:feed:{feed.feed_id}", "invalid JSON")
+            assert (await service.get(f"feeds/{feed.public_id}", {}))["feed"]["poll_interval_input"] == "60"
+            list_uuid = await runtime.repository.create_list("Legacy", interval=120)
+            async with runtime.database.transaction() as conn:
+                await conn.execute("DELETE FROM settings WHERE key=?", (f"poll_interval_input:list:{list_uuid}",))
+            row = await runtime.repository.get_list(list_uuid)
+            assert (await service.get(f"lists/{row['public_id']}", {}))["list"]["poll_interval_input"] == "120"
+        finally:
+            await runtime.close()
+
+    asyncio.run(run())
+
+
 def test_business_import_export_roundtrip_and_relationship_validation(tmp_path, monkeypatch):
     from types import SimpleNamespace
 
@@ -153,6 +230,31 @@ def test_business_import_normalizes_units_and_validates_before_mutation(tmp_path
             }
             for key, seconds in expected.items():
                 assert exported[key][0]["poll_interval"] == seconds
+            assert exported["feeds"][0]["poll_interval_input"] == "1d"
+            assert exported["subscription_lists"][0]["poll_interval_input"] == " 2 H "
+
+            # Optional display fields cannot override or bypass the effective interval.
+            for key in ("feeds", "subscription_lists"):
+                payload[key][0]["poll_interval_input"] = "1s"
+                path.write_text(json.dumps(payload), encoding="utf-8")
+                with pytest.raises(ValueError, match="must match"):
+                    await service._import_json(path)
+                assert await service._business_export() == exported
+                del payload[key][0]["poll_interval_input"]
+
+            # Seconds remain compatible with older importers while a new importer retains display spelling.
+            roundtrip_runtime = RSSRuntime({}, tmp_path / "roundtrip")
+            await roundtrip_runtime.initialize()
+            try:
+                roundtrip_service = ManagementService(roundtrip_runtime)
+                path.write_text(json.dumps(exported), encoding="utf-8")
+                await roundtrip_service._import_json(path)
+                roundtrip = await roundtrip_service._business_export()
+                for key in ("feeds", "subscription_lists"):
+                    assert roundtrip[key][0]["poll_interval"] == exported[key][0]["poll_interval"]
+                    assert roundtrip[key][0]["poll_interval_input"] == exported[key][0]["poll_interval_input"]
+            finally:
+                await roundtrip_runtime.close()
 
             for key in expected:
                 original = payload[key][0]["poll_interval"]
@@ -250,10 +352,10 @@ def test_management_create_and_list_member_add_accept_rsshub_routes(tmp_path, mo
             route = "/twitter/example"
             created = await service.post("feeds/create", {"url": route, "target_id": target.target_id})
             feed = created["feed"]
-            assert feed.url == route
+            assert feed["url"] == route
             listing = await service.post("lists/create", {"name": "RSSHub"})
             added = await service.post(f"lists/{listing['list_id']}/members/add", {"url": route})
-            assert added["feed_ids"] == [feed.public_id]
+            assert added["feed_ids"] == [feed["public_id"]]
             assert fetcher.calls == 1
             assert checked == ["https://rsshub.example" + route + "?key=secret"]
             export = await service._business_export()
@@ -294,13 +396,13 @@ def test_feed_translation_flag_create_and_update_contract(tmp_path, monkeypatch)
                 "feeds/create", {"url": "https://example.org/new", "target_id": target.target_id}
             )
             feed = created["feed"]
-            assert feed.translation_enabled is False
+            assert feed["translation_enabled"] is False
 
             enabled = await service.post(
                 "feeds/create",
                 {"url": "https://example.org/enabled", "target_id": target.target_id, "translation_enabled": True},
             )
-            assert enabled["feed"].translation_enabled is True
+            assert enabled["feed"]["translation_enabled"] is True
             repeated = await service.post(
                 "feeds/create",
                 {
@@ -309,12 +411,12 @@ def test_feed_translation_flag_create_and_update_contract(tmp_path, monkeypatch)
                     "translation_enabled": False,
                 },
             )
-            assert repeated["feed"].translation_enabled is True
+            assert repeated["feed"]["translation_enabled"] is True
 
-            unchanged = await service.post(f"feeds/{feed.public_id}/update", {"enabled": False})
-            assert unchanged.translation_enabled is False
-            changed = await service.post(f"feeds/{feed.public_id}/update", {"translation_enabled": True})
-            assert changed.translation_enabled is True
+            unchanged = await service.post(f"feeds/{feed['public_id']}/update", {"enabled": False})
+            assert unchanged["translation_enabled"] is False
+            changed = await service.post(f"feeds/{feed['public_id']}/update", {"translation_enabled": True})
+            assert changed["translation_enabled"] is True
             for endpoint, body in (
                 (
                     "feeds/create",
@@ -324,7 +426,7 @@ def test_feed_translation_flag_create_and_update_contract(tmp_path, monkeypatch)
                         "translation_enabled": "true",
                     },
                 ),
-                (f"feeds/{feed.public_id}/update", {"translation_enabled": "false"}),
+                (f"feeds/{feed['public_id']}/update", {"translation_enabled": "false"}),
             ):
                 with pytest.raises(ValueError, match="translation_enabled must be boolean"):
                     await service.post(endpoint, body)

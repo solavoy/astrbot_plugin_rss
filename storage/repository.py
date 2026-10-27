@@ -6,6 +6,7 @@ from typing import Any
 
 from ..core.models import Article, ContentBlock, DeliveryTarget, Feed, now_ts
 from .database import Database
+from .interval_inputs import interval_input_key, save_interval_input
 
 
 def _json(value: Any) -> str:
@@ -41,6 +42,7 @@ class Repository:
         description: str = "",
         poll_interval: int | None = None,
         translation_enabled: bool = False,
+        poll_interval_input: str | None = None,
     ) -> Feed:
         if type(translation_enabled) is not bool:
             raise ValueError("translation_enabled must be a boolean")
@@ -58,6 +60,7 @@ class Repository:
                     "INSERT INTO feeds(feed_id,public_id,url,title,description,poll_interval,translation_enabled,created_at) VALUES(?,?,?,?,?,?,?,?)",
                     (feed_id, public_id, url, title, description, poll_interval, int(translation_enabled), now_ts()),
                 )
+                await save_interval_input(conn, "feed", feed_id, poll_interval, poll_interval_input)
                 row = await (await conn.execute("SELECT * FROM feeds WHERE feed_id=?", (feed_id,))).fetchone()
         return self._feed(row)
 
@@ -86,6 +89,7 @@ class Repository:
         next_fetch_at: float,
         metadata: dict[str, Any] | None = None,
         translation_enabled: bool = False,
+        poll_interval_input: str | None = None,
     ) -> Feed:
         """Atomically persist a validated initial fetch and its no-history baseline."""
         if type(translation_enabled) is not bool:
@@ -112,6 +116,7 @@ class Repository:
                     int(translation_enabled),
                 ),
             )
+            await save_interval_input(conn, "feed", feed_id, poll_interval, poll_interval_input)
             for article in articles:
                 await conn.execute(
                     "INSERT OR IGNORE INTO articles(article_id,feed_id,entry_id,canonical_url,title,author,published_at,updated_at,first_seen_at,categories,content_hash,content_blocks,metadata) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -185,6 +190,10 @@ class Repository:
                 f"UPDATE feeds SET {','.join(f'{k}=?' for k in updates)} WHERE feed_id=?", (*updates.values(), feed_id)
             )
             row = await (await conn.execute("SELECT * FROM feeds WHERE feed_id=?", (feed_id,))).fetchone()
+            if row is not None and "poll_interval" in updates:
+                await save_interval_input(
+                    conn, "feed", feed_id, updates["poll_interval"], values.get("poll_interval_input")
+                )
         if row is None:
             raise KeyError(feed_id)
         return self._feed(row)
@@ -286,7 +295,9 @@ class Repository:
             )
         ]
 
-    async def create_list(self, name: str, description: str = "", interval: int | None = None) -> str:
+    async def create_list(
+        self, name: str, description: str = "", interval: int | None = None, poll_interval_input: str | None = None
+    ) -> str:
         name = self._list_name(name)
         interval = _poll_interval(interval)
         list_id, now = str(uuid.uuid4()), now_ts()
@@ -301,6 +312,7 @@ class Repository:
                 "INSERT INTO subscription_lists(list_id,public_id,name,description,poll_interval,created_at) VALUES(?,?,?,?,?,?)",
                 (list_id, public_id, name, description, interval, now),
             )
+            await save_interval_input(conn, "list", list_id, interval, poll_interval_input)
         return list_id
 
     @staticmethod
@@ -353,6 +365,10 @@ class Repository:
                     "UPDATE subscription_lists SET " + ",".join(f"{key}=?" for key in updates) + " WHERE list_id=?",
                     (*updates.values(), list_id),
                 )
+                if "poll_interval" in updates:
+                    await save_interval_input(
+                        conn, "list", list_id, updates["poll_interval"], values.get("poll_interval_input")
+                    )
             result = await (
                 await conn.execute("SELECT * FROM subscription_lists WHERE list_id=?", (list_id,))
             ).fetchone()
@@ -361,6 +377,7 @@ class Repository:
     async def delete_list(self, list_id: str) -> bool:
         async with self.db.transaction() as conn:
             cur = await conn.execute("DELETE FROM subscription_lists WHERE list_id=?", (list_id,))
+            await conn.execute("DELETE FROM settings WHERE key=?", (interval_input_key("list", list_id),))
             return cur.rowcount > 0
 
     async def list_lists(self) -> list[dict[str, Any]]:

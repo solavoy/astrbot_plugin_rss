@@ -10,6 +10,7 @@ import sqlite3
 import time
 import uuid
 from contextlib import closing
+from dataclasses import asdict
 from datetime import date, datetime, timedelta
 from datetime import time as datetime_time
 from pathlib import Path
@@ -19,6 +20,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from ..core.feed_urls import build_feed_request, is_relative_feed_reference, normalize_relative_feed_reference
 from ..core.security import validate_public_url
 from ..storage.database import Database
+from ..storage.interval_inputs import attach_interval_inputs, interval_input_text, save_interval_input
 from ..storage.management_repository import ManagementRepository
 from .facade import normalize_poll_interval
 
@@ -138,6 +140,7 @@ class ManagementService:
                 page,
                 size,
             )
+            await attach_interval_inputs(self.runtime.database, "list", result["items"])
             result["timezone"] = self.timezone
             return result
         if endpoint.startswith("lists/") and endpoint.count("/") == 1:
@@ -330,11 +333,13 @@ class ManagementService:
                 raise ValueError("translation_enabled must be boolean")
             feed = await self.services.feeds.create(
                 url,
-                poll_interval=self._interval(body.get("poll_interval")),
+                poll_interval=body.get("poll_interval"),
                 translation_enabled=translation_enabled,
             )
             await self.services.subscriptions.subscribe(target_id, feed.feed_id)
-            return {"feed": feed}
+            feed_data = asdict(feed)
+            await attach_interval_inputs(self.runtime.database, "feed", [feed_data])
+            return {"feed": feed_data}
         if endpoint.startswith("feeds/"):
             parts = endpoint.split("/")
             feed_id = (await self._feed_by_public_id(parts[1])).feed_id
@@ -349,8 +354,10 @@ class ManagementService:
                         raise ValueError("translation_enabled must be boolean")
                     values["translation_enabled"] = body["translation_enabled"]
                 if "poll_interval" in body:
-                    values["poll_interval"] = self._interval(body["poll_interval"])
-                return await self.services.feeds.update(feed_id, **values)
+                    values["poll_interval"] = body["poll_interval"]
+                feed = asdict(await self.services.feeds.update(feed_id, **values))
+                await attach_interval_inputs(self.runtime.database, "feed", [feed])
+                return feed
             if len(parts) == 3 and parts[2] == "refresh":
                 return await self.services.feeds.refresh(feed_id)
             if len(parts) == 3 and parts[2] == "unsubscribe":
@@ -367,12 +374,14 @@ class ManagementService:
         if endpoint == "lists/create":
             name = self._text(body, "name", 1, 100)
             list_uuid = await self.services.lists.create(
-                name, str(body.get("description", ""))[:1000], self._interval(body.get("poll_interval"))
+                name, str(body.get("description", ""))[:1000], body.get("poll_interval")
             )
             created = await self.runtime.repository.get_list(list_uuid)
+            await attach_interval_inputs(self.runtime.database, "list", [created])
             return {
                 "list_id": created["public_id"],
                 "public_id": created["public_id"],
+                "poll_interval_input": created["poll_interval_input"],
             }
         parts = endpoint.split("/")
         if parts[0] == "lists" and len(parts) >= 3:
@@ -535,6 +544,8 @@ class ManagementService:
 
     async def _business_export(self):
         raw = await self.services.data.export()
+        await attach_interval_inputs(self.runtime.database, "feed", raw["feeds"])
+        await attach_interval_inputs(self.runtime.database, "list", raw["subscription_lists"])
         return {
             "feeds": [
                 {
@@ -547,6 +558,7 @@ class ManagementService:
                             "title",
                             "description",
                             "poll_interval",
+                            "poll_interval_input",
                         )
                     },
                     "enabled": bool(row["enabled"]),
@@ -556,7 +568,17 @@ class ManagementService:
             ],
             "subscription_lists": [
                 {
-                    **{key: row[key] for key in ("list_id", "public_id", "name", "description", "poll_interval")},
+                    **{
+                        key: row[key]
+                        for key in (
+                            "list_id",
+                            "public_id",
+                            "name",
+                            "description",
+                            "poll_interval",
+                            "poll_interval_input",
+                        )
+                    },
                     "enabled": bool(row["enabled"]),
                 }
                 for row in raw["subscription_lists"]
@@ -623,6 +645,9 @@ class ManagementService:
                     raise ValueError(
                         f"{key} poll_interval must be at least {self.runtime.config.min_poll_interval} seconds"
                     )
+                if key in {"feeds", "subscription_lists"}:
+                    display_input = row.get("poll_interval_input", row.get("poll_interval"))
+                    row["poll_interval_input"] = interval_input_text(display_input, interval)
                 row["poll_interval"] = interval
                 if "enabled" in row and type(row["enabled"]) is not bool:
                     raise ValueError(f"{key} enabled must be boolean")
@@ -699,6 +724,7 @@ class ManagementService:
                         ),
                     )
                 feed_map[row["feed_id"]] = mapped[0]
+                await save_interval_input(conn, "feed", mapped[0], row["poll_interval"], row["poll_interval_input"])
             for row in list_rows:
                 normalized_name = row["name"].strip()
                 existing = await (
@@ -728,6 +754,9 @@ class ManagementService:
                     ),
                 )
                 list_map[row["list_id"]] = proposed_list_id
+                await save_interval_input(
+                    conn, "list", proposed_list_id, row["poll_interval"], row["poll_interval_input"]
+                )
             targets = {row[0] for row in await (await conn.execute("SELECT target_id FROM targets")).fetchall()}
             for row in payload.get("list_feeds", []):
                 fid, lid = feed_map[row["feed_id"]], list_map[row["list_id"]]

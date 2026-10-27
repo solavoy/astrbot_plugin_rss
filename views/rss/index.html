@@ -461,7 +461,7 @@
                           {{f.translation_enabled?'开启':'关闭'}}
                         </td>
                         <td>
-                          {{f.poll_interval?f.poll_interval+'s':'继承全局'}}
+                          {{intervalLabel(f)}}
                         </td>
                         <td>
                           {{date(f.last_fetch_at)}}
@@ -715,7 +715,7 @@
                           {{l.enabled?'启用':'暂停'}}
                         </td>
                         <td>
-                          {{l.poll_interval?l.poll_interval+'s':'继承全局'}}
+                          {{intervalLabel(l)}}
                         </td>
                         <td>
                           {{l.member_count||0}}

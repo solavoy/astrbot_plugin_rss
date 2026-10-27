@@ -54,7 +54,7 @@ _LOGGER = logging.getLogger(__name__)
 
 
 def _normalize_group_value(key: str, value: Any) -> tuple[Any, bool]:
-    """Normalize supported dashboard intervals and numeric strings."""
+    """Normalize supported dashboard values for runtime use."""
     if key == "global_poll_interval":
         try:
             normalized = parse_interval_seconds(value)
@@ -89,6 +89,14 @@ def _normalize_group_value(key: str, value: Any) -> tuple[Any, bool]:
                 return value, False
         return value, True
     return value, False
+
+
+def _normalize_persisted_group_value(key: str, value: Any) -> tuple[Any, bool]:
+    """Keep interval text in the host config; convert seconds only at runtime."""
+    normalized, valid = _normalize_group_value(key, value)
+    if key == "global_poll_interval" and valid:
+        return value if isinstance(value, str) else str(normalized), True
+    return normalized, valid
 
 
 def _is_legacy_sentinel(key: str, value: Any) -> bool:
@@ -169,12 +177,12 @@ def migrate_legacy_config(config):
             has_group_value = key in group
             group_value = group.get(key, default)
             if has_group_value and key in {"global_poll_interval", "request_timeout"} and _is_zero_numeric(group_value):
-                group[key] = default
+                group[key] = _normalize_persisted_group_value(key, default)[0]
                 _LOGGER.warning("配置项 %s.%s 为兼容空值，已恢复默认值", group_name, key)
                 changed = True
-                group_value = default
+                group_value = group[key]
             elif has_group_value:
-                normalized, valid = _normalize_group_value(key, group_value)
+                normalized, valid = _normalize_persisted_group_value(key, group_value)
                 if valid and normalized != group_value:
                     group[key] = normalized
                     group_value = normalized
@@ -184,10 +192,10 @@ def migrate_legacy_config(config):
             legacy_present = key in config
             legacy_is_sentinel = not legacy_present or _is_legacy_sentinel(key, legacy_value)
             if not legacy_is_sentinel:
-                normalized_legacy, valid_legacy = _normalize_group_value(key, legacy_value)
+                normalized_legacy, valid_legacy = _normalize_persisted_group_value(key, legacy_value)
                 if valid_legacy:
-                    group_valid = not has_group_value or _normalize_group_value(key, group_value)[1]
-                    if group_valid and (not has_group_value or group_value == default):
+                    normalized_group, group_valid = _normalize_group_value(key, group_value)
+                    if not has_group_value or (group_valid and normalized_group == default):
                         group[key] = normalized_legacy
                 else:
                     _log_bad_legacy(f"{group_name}.{key}", legacy_value)

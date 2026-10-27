@@ -9,6 +9,7 @@ from ..core.feed_urls import build_feed_request, is_relative_feed_reference, nor
 from ..core.intervals import parse_interval_seconds
 from ..core.models import Feed
 from ..core.security import validate_public_url
+from ..storage.interval_inputs import interval_input_text
 
 
 def normalize_poll_interval(value):
@@ -86,7 +87,9 @@ class _Feeds:
     ):
         if type(translation_enabled) is not bool:
             raise ValueError("translation_enabled must be a boolean")
+        raw_interval = poll_interval
         poll_interval = normalize_poll_interval(poll_interval)
+        poll_interval_input = interval_input_text(raw_interval, poll_interval)
         relative = is_relative_feed_reference(url)
         if relative:
             normalized_url = normalize_relative_feed_reference(url)
@@ -174,6 +177,7 @@ class _Feeds:
                 if request.fingerprint
                 else None,
                 translation_enabled=translation_enabled,
+                poll_interval_input=poll_interval_input,
             )
 
     async def update(self, feed_id: str, **values):
@@ -190,7 +194,9 @@ class _Feeds:
             else:
                 await validate_public_url(request.request_url)
         if "poll_interval" in values:
-            values["poll_interval"] = normalize_poll_interval(values["poll_interval"])
+            raw_interval = values["poll_interval"]
+            values["poll_interval"] = normalize_poll_interval(raw_interval)
+            values["poll_interval_input"] = interval_input_text(raw_interval, values["poll_interval"])
         return await self.s.repo.update_feed(feed_id, **values)
 
     async def detail(self, feed_id: str):
@@ -245,13 +251,14 @@ class _Lists:
         return matches[0]
 
     async def create(self, name: str, description: str = "", interval: int | str | None = None):
+        raw_interval = interval
         interval = normalize_poll_interval(interval)
         if not isinstance(name, str):
             raise ValueError("list name must be a string")
         name = name.strip()
         if not 1 <= len(name) <= 100:
             raise ValueError("list name must contain 1..100 characters")
-        return await self.s.repo.create_list(name, description, interval)
+        return await self.s.repo.create_list(name, description, interval, interval_input_text(raw_interval, interval))
 
     async def update(self, list_id: str, **values):
         updates = {}
@@ -271,6 +278,7 @@ class _Lists:
             updates["enabled"] = values["enabled"]
         if "poll_interval" in values:
             updates["poll_interval"] = normalize_poll_interval(values["poll_interval"])
+            updates["poll_interval_input"] = interval_input_text(values["poll_interval"], updates["poll_interval"])
         return await self.s.repo.update_list(list_id, **updates)
 
     async def delete(self, list_id: str):

@@ -222,7 +222,7 @@ def test_legacy_config_without_general_settings_keeps_defaults_and_migrates():
     config = PluginConfig.from_mapping(legacy)
     assert config.timezone == "Asia/Shanghai"
     assert config.group_admin_only is False
-    assert legacy["fetch"] == {"global_poll_interval": 120, "request_timeout": 10.0}
+    assert legacy["fetch"] == {"global_poll_interval": "120", "request_timeout": 10.0}
     assert "general" not in legacy
 
 
@@ -279,7 +279,7 @@ def test_legacy_values_migrate_once_and_group_nondefaults_win():
         telegraph_access_token="legacy-token",
     )
     migrate_legacy_config(legacy)
-    assert legacy["fetch"] == {"global_poll_interval": 90, "request_timeout": 20}
+    assert legacy["fetch"] == {"global_poll_interval": "90", "request_timeout": 20}
     assert legacy["network"]["proxy"] == "http://user:pass@proxy.example:8080"
     assert legacy["telegram"]["telegraph_access_token"] == "legacy-token"
     assert legacy["global_poll_interval"] == 0
@@ -300,7 +300,7 @@ def test_legacy_values_migrate_once_and_group_nondefaults_win():
         telegraph_access_token="old-token",
     )
     migrate_legacy_config(grouped)
-    assert grouped["fetch"] == {"global_poll_interval": 180, "request_timeout": 12}
+    assert grouped["fetch"] == {"global_poll_interval": "180", "request_timeout": 12}
     assert grouped["network"]["proxy"] == "http://new.example:8080"
     assert grouped["telegram"]["telegraph_access_token"] == "new-token"
     assert grouped.saved == 1
@@ -322,14 +322,14 @@ def test_host_null_defaults_cannot_overwrite_grouped_settings():
         if config[key] is None:
             config[key] = default
     migrate_legacy_config(config)
-    assert config["fetch"] == {"global_poll_interval": 300, "request_timeout": 15.0}
+    assert config["fetch"] == {"global_poll_interval": "300", "request_timeout": 15.0}
     assert PluginConfig.from_mapping(config).request_timeout == 15.0
 
 
 def test_startup_repairs_legacy_zero_timeout_but_direct_mapping_stays_strict(caplog):
     config = {"fetch": {"global_poll_interval": 0, "request_timeout": 0.0}}
     migrate_legacy_config(config)
-    assert config["fetch"] == {"global_poll_interval": 300, "request_timeout": 15.0}
+    assert config["fetch"] == {"global_poll_interval": "300", "request_timeout": 15.0}
     assert "fetch.request_timeout" in caplog.text
     with pytest.raises(ConfigurationError):
         PluginConfig.from_mapping({"fetch": {"request_timeout": 0}})
@@ -345,7 +345,7 @@ def test_invalid_legacy_values_do_not_override_valid_group_defaults(value, caplo
         "request_timeout": value,
     }
     migrate_legacy_config(config)
-    assert config["fetch"] == {"global_poll_interval": 300, "request_timeout": 15.0}
+    assert config["fetch"] == {"global_poll_interval": "300", "request_timeout": 15.0}
     if value != 0:
         assert "global_poll_interval" in caplog.text
         assert "request_timeout" in caplog.text
@@ -372,7 +372,7 @@ def test_global_interval_units_in_grouped_and_legacy_config(value, seconds):
         assert PluginConfig.from_mapping(mapping).global_poll_interval == seconds
         migrate_legacy_config(mapping)
         assert PluginConfig.from_mapping(mapping).global_poll_interval == seconds
-        assert mapping["fetch"]["global_poll_interval"] == seconds
+        assert mapping["fetch"]["global_poll_interval"] == value
 
 
 @pytest.mark.parametrize("value", ["0d", "0h", "0m", "0s", "-1h", "1.5h", "1h30m", "1w", ""])
@@ -385,8 +385,77 @@ def test_interval_units_keep_grouped_precedence_during_legacy_migration():
     mapping = {"fetch": {"global_poll_interval": "2h"}, "global_poll_interval": "30m"}
     assert PluginConfig.from_mapping(mapping).global_poll_interval == 7200
     migrate_legacy_config(mapping)
-    assert mapping["fetch"]["global_poll_interval"] == 7200
+    assert mapping["fetch"]["global_poll_interval"] == "2h"
     assert mapping["global_poll_interval"] == 0
+
+
+@pytest.mark.parametrize(
+    ("value", "persisted", "seconds"),
+    [("1h", "1h", 3600), ("3600", "3600", 3600), (" 2 H ", " 2 H ", 7200), (3600, "3600", 3600)],
+)
+def test_migration_saves_host_compatible_interval_text_once(value, persisted, seconds):
+    interval_schema = json.loads((Path(__file__).resolve().parents[1] / "_conf_schema.json").read_text("utf-8"))[
+        "fetch"
+    ]["items"]["global_poll_interval"]
+
+    class HostConfig(dict):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.snapshots = []
+
+        def save_config(self):
+            snapshot = json.loads(json.dumps(self))
+            assert interval_schema["type"] in {"string", "text"}
+            assert isinstance(snapshot["fetch"]["global_poll_interval"], str)
+            self.snapshots.append(snapshot)
+
+    # A separate migration forces a save even when the interval text is valid.
+    config = HostConfig(fetch={"global_poll_interval": value, "request_timeout": "15.5"})
+    assert migrate_legacy_config(config) is config
+    assert config["fetch"]["global_poll_interval"] == persisted
+    assert len(config.snapshots) == 1
+    snapshot = config.snapshots[0]
+    assert snapshot["fetch"]["global_poll_interval"] == persisted
+    assert PluginConfig.from_mapping(config).global_poll_interval == seconds
+    assert dict(config) == snapshot
+
+    migrate_legacy_config(config)
+    assert len(config.snapshots) == 1
+    assert dict(config) == snapshot
+    reloaded = HostConfig(snapshot)
+    migrate_legacy_config(reloaded)
+    assert reloaded.snapshots == []
+    assert PluginConfig.from_mapping(reloaded).global_poll_interval == seconds
+    assert dict(reloaded) == snapshot
+
+
+@pytest.mark.parametrize("value", ["1h", "3600", " 2 H "])
+def test_valid_grouped_interval_text_does_not_trigger_save(value):
+    class HostConfig(dict):
+        def save_config(self):
+            pytest.fail("valid interval text must not be rewritten")
+
+    config = HostConfig(fetch={"global_poll_interval": value, "request_timeout": 15.0})
+    migrate_legacy_config(config)
+    migrate_legacy_config(config)
+    assert config["fetch"]["global_poll_interval"] == value
+
+
+@pytest.mark.parametrize("default", [300, "300", "5m", " 300 S "])
+def test_legacy_interval_overrides_equivalent_group_default_and_stays_text(default):
+    config = {"fetch": {"global_poll_interval": default}, "global_poll_interval": " 2 H "}
+    migrate_legacy_config(config)
+    assert config["fetch"]["global_poll_interval"] == " 2 H "
+    assert config["global_poll_interval"] == 0
+    assert PluginConfig.from_mapping(config).global_poll_interval == 7200
+
+
+@pytest.mark.parametrize("zero", [0, 0.0, "0", " 0.0 "])
+def test_zero_interval_repair_writes_schema_compatible_default(zero):
+    config = {"fetch": {"global_poll_interval": zero}}
+    migrate_legacy_config(config)
+    assert config["fetch"]["global_poll_interval"] == "300"
+    assert PluginConfig.from_mapping(config).global_poll_interval == 300
 
 
 def test_send_as_media_is_strict_boolean_and_defaults_on():

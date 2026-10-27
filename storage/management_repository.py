@@ -6,6 +6,8 @@ from datetime import datetime
 from datetime import time as datetime_time
 from zoneinfo import ZoneInfo
 
+from .interval_inputs import attach_interval_inputs
+
 
 def _local_day_start(timestamp: float, timezone: str) -> float:
     zone = ZoneInfo(timezone)
@@ -38,6 +40,7 @@ class ManagementRepository:
         result = await self.page(sql, (f"%{q}%", f"%{q}%"), page, size)
         for row in result["items"]:
             row["translation_enabled"] = bool(row["translation_enabled"])
+        await attach_interval_inputs(self.db, "feed", result["items"])
         return result
 
     async def dashboard(self):
@@ -147,6 +150,7 @@ class ManagementRepository:
         )
         feed_data = dict(feed)
         feed_data["translation_enabled"] = bool(feed_data["translation_enabled"])
+        await attach_interval_inputs(self.db, "feed", [feed_data])
         return {
             "feed": feed_data,
             "articles": [dict(r) for r in articles],
@@ -201,8 +205,10 @@ class ManagementRepository:
             "WHERE lf.list_id=? ORDER BY l.fetched_at DESC,l.id DESC LIMIT 100",
             (list_id,),
         )
+        list_data = dict(row)
+        await attach_interval_inputs(self.db, "list", [list_data])
         return {
-            "list": dict(row),
+            "list": list_data,
             "members": [dict(r) for r in members],
             "subscribers": subscribers,
             "articles": [dict(r) for r in articles],
