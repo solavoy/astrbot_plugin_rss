@@ -417,48 +417,89 @@ def _strip_raw_html(value: str, children: list[Any]) -> str:
     return _restore_ranges(masked, replacements)
 
 
-def _source_image_end(value: str, start: int, expected_url: str) -> tuple[int, str] | None:
-    if start > 0 and value[start - 1] == "!":
-        return None
-    if _is_escaped(value, start):
-        return None
-    label_end = value.find("](", start + 2)
-    if label_end < 0:
-        return None
-    depth = 1
-    cursor = label_end + 2
-    quote = ""
+def _matching_square_bracket(value: str, opening: int) -> int | None:
+    depth = 0
+    escaped = False
+    code_delimiter = ""
+    cursor = opening
     while cursor < len(value):
-        character = value[cursor]
-        if character == "\\":
-            cursor += 2
+        if escaped:
+            escaped = False
+            cursor += 1
             continue
-        if quote:
-            if character == quote:
-                quote = ""
-        elif character in {'"', "'"}:
-            quote = character
-        elif character == "(":
+        if value[cursor] == "\\":
+            escaped = True
+            cursor += 1
+            continue
+        if code_delimiter:
+            if value.startswith(code_delimiter, cursor):
+                cursor += len(code_delimiter)
+                code_delimiter = ""
+            else:
+                cursor += 1
+            continue
+        if value[cursor] == "`":
+            run_end = cursor + 1
+            while run_end < len(value) and value[run_end] == "`":
+                run_end += 1
+            delimiter = value[cursor:run_end]
+            if value.find(delimiter, run_end) >= 0:
+                code_delimiter = delimiter
+                cursor = run_end
+                continue
+        if value[cursor] == "[":
             depth += 1
-        elif character == ")":
+        elif value[cursor] == "]":
             depth -= 1
             if depth == 0:
-                candidate = value[start : cursor + 1]
-                found = [
-                    token
-                    for token in _token_children(markdown_tokens(candidate))
-                    if token.type == "image" and str((token.attrs or {}).get("src") or "") == expected_url
-                ]
-                if found:
-                    return cursor + 1, str(found[0].content or "")
-                return None
+                return cursor
         cursor += 1
     return None
 
 
-def _inline_image_spans(value: str) -> list[tuple[int, int, str, str, tuple[str, ...]]]:
+def _source_image_end(value: str, start: int, expected_url: str) -> tuple[int, str, str] | None:
+    if start > 0 and value[start - 1] == "!":
+        return None
+    if _is_escaped(value, start):
+        return None
+    label_open = start + 1
+    label_end = _matching_square_bracket(value, label_open)
+    if label_end is None or label_end + 1 >= len(value) or value[label_end + 1] != "(":
+        return None
+    close = _matching_parenthesis(value, label_end + 1)
+    if close is None:
+        return None
+    candidate = value[start : close + 1]
+    found = [
+        token
+        for token in _token_children(markdown_tokens(candidate))
+        if token.type == "image" and str((token.attrs or {}).get("src") or "") == expected_url
+    ]
+    if not found:
+        return None
+    # Keep the original destination spelling (including percent escapes and an
+    # optional title) for a fallback link generated from this Markdown image.
+    destination = value[label_end + 2 : close]
+    return close + 1, str(found[0].content or ""), destination
+
+
+def _inline_code_ranges(value: str, children: list[Any]) -> list[tuple[int, int]]:
+    ranges: list[tuple[int, int]] = []
+    cursor = 0
+    for child in children:
+        if child.type != "code_inline" or not child.markup:
+            continue
+        opening = value.find(child.markup, cursor)
+        closing = value.find(child.markup, opening + len(child.markup)) if opening >= 0 else -1
+        if opening >= 0 and closing >= 0:
+            ranges.append((opening, closing + len(child.markup)))
+            cursor = closing + len(child.markup)
+    return ranges
+
+
+def _inline_image_spans(value: str) -> list[tuple[int, int, str, str, tuple[str, ...], str, bool, tuple[str, ...]]]:
     """Locate recognized Markdown image tokens in their original inline source."""
-    spans: list[tuple[int, int, str, str, tuple[str, ...]]] = []
+    spans: list[tuple[int, int, str, str, tuple[str, ...], str, bool, tuple[str, ...]]] = []
     search_from = 0
     for block in markdown_tokens(value):
         if block.type != "inline":
@@ -471,16 +512,9 @@ def _inline_image_spans(value: str) -> list[tuple[int, int, str, str, tuple[str,
         if inline_position < 0:
             continue
         search_from = inline_position + len(inline_source)
-        code_ranges: list[tuple[int, int]] = []
-        for child in children:
-            if child.type != "code_inline" or not child.markup:
-                continue
-            delimiter = child.markup
-            opening = inline_source.find(delimiter)
-            closing = inline_source.find(delimiter, opening + len(delimiter)) if opening >= 0 else -1
-            if opening >= 0 and closing >= 0:
-                code_ranges.append((opening, closing + len(delimiter)))
+        code_ranges = _inline_code_ranges(inline_source, children)
         active: list[tuple[str, str]] = []
+        active_links: list[tuple[str, tuple[str, ...]]] = []
         image_cursor = 0
         for child in children:
             if child.type in {"strong_open", "em_open"}:
@@ -491,6 +525,11 @@ def _inline_image_spans(value: str) -> list[tuple[int, int, str, str, tuple[str,
                     if active[index][0] == expected:
                         active.pop(index)
                         break
+            elif child.type == "link_open":
+                active_links.append((str((child.attrs or {}).get("href") or ""), tuple(mark for _, mark in active)))
+            elif child.type == "link_close":
+                if active_links:
+                    active_links.pop()
             elif child.type == "image":
                 url = str((child.attrs or {}).get("src") or "")
                 if not url:
@@ -501,22 +540,46 @@ def _inline_image_spans(value: str) -> list[tuple[int, int, str, str, tuple[str,
                     end = _source_image_end(inline_source, candidate_start, url)
                     in_code = any(left <= candidate_start < right for left, right in code_ranges)
                     if end and not in_code:
-                        found = (candidate_start, end[0], end[1])
+                        found = (candidate_start, end[0], end[1], end[2])
                         break
                     candidate_start = inline_source.find("![", candidate_start + 2)
                 if not found:
                     continue
-                left, right, alt = found
+                left, right, alt, destination = found
+                image_styles = tuple(mark for _, mark in active)
+                link_styles = active_links[-1][1] if active_links else ()
+                inner_styles = (
+                    image_styles[len(link_styles) :]
+                    if image_styles[: len(link_styles)] == link_styles
+                    else image_styles
+                )
                 spans.append(
-                    (inline_position + left, inline_position + right, url, alt, tuple(mark for _, mark in active))
+                    (
+                        inline_position + left,
+                        inline_position + right,
+                        url,
+                        alt,
+                        inner_styles,
+                        destination,
+                        bool(active_links and active_links[-1][0]),
+                        link_styles,
+                    )
                 )
                 image_cursor = right
     return spans
 
 
+def _escape_markdown_label(value: object) -> str:
+    """Keep generated fallback labels literal inside Markdown link labels."""
+    return re.sub(r"([\\`*_{}\[\]()#+\-.!|>~])", r"\\\1", str(value or ""))
+
+
 def _matching_parenthesis(value: str, opening: int) -> int | None:
     depth = 0
     escaped = False
+    seen_destination = False
+    title_allowed = False
+    title_quote = ""
     for index in range(opening, len(value)):
         if escaped:
             escaped = False
@@ -524,6 +587,20 @@ def _matching_parenthesis(value: str, opening: int) -> int | None:
         if value[index] == "\\":
             escaped = True
             continue
+        if title_quote:
+            if value[index] == title_quote:
+                title_quote = ""
+            continue
+        if depth == 1:
+            if value[index].isspace():
+                title_allowed = seen_destination
+                continue
+            if title_allowed and value[index] in {'"', "'"}:
+                title_quote = value[index]
+                title_allowed = False
+                continue
+            seen_destination = True
+            title_allowed = False
         if value[index] == "(":
             depth += 1
         elif value[index] == ")":
@@ -533,32 +610,129 @@ def _matching_parenthesis(value: str, opening: int) -> int | None:
     return None
 
 
-def _split_links_around_placeholders(value: str) -> str:
-    """Keep a Markdown anchor's visible text as links around native images."""
-    for match in reversed(list(_IMAGE_PLACEHOLDER.finditer(value))):
-        placeholder = match.group(0)
-        start = value.rfind("[", 0, match.start())
-        label_end = value.find("](", match.end())
-        if start < 0 or label_end < 0:
+def _source_link_for_placeholder(
+    value: str, marker: re.Match[str], href: str, code_ranges: list[tuple[int, int]]
+) -> tuple[int, int, int, str] | None:
+    candidates: list[tuple[int, int, int, str]] = []
+    for start in range(marker.start()):
+        if value[start] != "[" or _is_escaped(value, start):
             continue
-        parenthesis_open = label_end + 1
-        close = _matching_parenthesis(value, parenthesis_open)
+        if (start > 0 and value[start - 1] == "!") or any(left <= start < right for left, right in code_ranges):
+            continue
+        label_end = _matching_square_bracket(value, start)
+        if label_end is None or not start < marker.start() < label_end:
+            continue
+        if label_end + 1 >= len(value) or value[label_end + 1] != "(":
+            continue
+        close = _matching_parenthesis(value, label_end + 1)
         if close is None:
             continue
-        candidate = value[start : close + 1]
-        link = next((token for token in _token_children(markdown_tokens(candidate)) if token.type == "link_open"), None)
-        href = str((link.attrs or {}).get("href") or "") if link else ""
-        if not href:
+        children = list(_token_children(markdown_tokens(value[start : close + 1])))
+        links = [child for child in children if child.type == "link_open"]
+        closes = [child for child in children if child.type == "link_close"]
+        if len(links) != 1 or len(closes) != 1 or str((links[0].attrs or {}).get("href") or "") != href:
             continue
-        prefix = value[start + 1 : match.start()]
-        suffix = value[match.end() : label_end]
-        before = f"[{prefix}]({href})" if prefix.strip() else ""
-        after = f"[{suffix}]({href})" if suffix.strip() else ""
-        if before or after:
-            replacement = before + placeholder + after
-        else:
-            replacement = placeholder + f"[打开链接]({href})"
-        value = value[:start] + replacement + value[close + 1 :]
+        active = False
+        marker_in_link = False
+        for child in children:
+            if child.type == "link_open":
+                active = True
+            elif child.type == "link_close":
+                active = False
+            elif child.type == "text" and active and marker.group(0) in (child.content or ""):
+                marker_in_link = True
+        if marker_in_link:
+            candidates.append((start, label_end, close + 1, value[label_end + 2 : close]))
+    return max(candidates, key=lambda item: item[2] - item[0]) if candidates else None
+
+
+def _split_links_around_placeholders(value: str, placeholder_styles: dict[str, tuple[str, ...]] | None = None) -> str:
+    """Keep a Markdown anchor's visible text as links around native images."""
+    edits: list[tuple[int, int, str]] = []
+    search_from = 0
+    for block in markdown_tokens(value):
+        if block.type != "inline":
+            continue
+        inline_source = block.content
+        inline_position = value.find(inline_source, search_from) if inline_source else -1
+        if inline_position < 0:
+            continue
+        search_from = inline_position + len(inline_source)
+        placeholders = list(_IMAGE_PLACEHOLDER.finditer(inline_source))
+        if not placeholders:
+            continue
+        children = block.children or []
+        placeholder_hrefs: dict[str, str] = {}
+        active_links: list[str] = []
+        for child in children:
+            if child.type == "link_open":
+                active_links.append(str((child.attrs or {}).get("href") or ""))
+            elif child.type == "link_close":
+                if active_links:
+                    active_links.pop()
+            elif child.type == "text" and active_links:
+                for match in _IMAGE_PLACEHOLDER.finditer(child.content or ""):
+                    placeholder_hrefs[match.group(0)] = active_links[-1]
+
+        if not placeholder_hrefs:
+            continue
+        code_ranges = _inline_code_ranges(inline_source, children)
+        grouped: dict[tuple[int, int, int, str], list[re.Match[str]]] = {}
+        for match in placeholders:
+            href = placeholder_hrefs.get(match.group(0))
+            candidate = _source_link_for_placeholder(inline_source, match, href, code_ranges) if href else None
+            if candidate:
+                grouped.setdefault(candidate, []).append(match)
+
+        for (start, label_end, close, raw_destination), matches in grouped.items():
+            styles = next((placeholder_styles or {}).get(match.group(0), ()) for match in matches)
+            open_style = "".join(styles)
+            close_style = "".join(reversed(styles))
+            has_link_text = any(
+                inline_source[left:right].strip()
+                for left, right in zip(
+                    [start + 1, *(match.end() for match in matches)],
+                    [*(match.start() for match in matches), label_end],
+                )
+            )
+            edit_start, edit_end = start, close
+            # If emphasis surrounds only an image link, discard that empty
+            # wrapper. Otherwise keep paragraph-level emphasis in place and
+            # close/reopen it at each native image boundary below.
+            if (
+                styles
+                and not has_link_text
+                and inline_source[:start].endswith(open_style)
+                and inline_source[close:].startswith(close_style)
+            ):
+                edit_start -= len(open_style)
+                edit_end += len(close_style)
+                open_style = close_style = ""
+            pieces: list[str] = []
+            cursor = start + 1
+            for match in matches:
+                text = inline_source[cursor : match.start()]
+                if text.strip():
+                    pieces.append(f"[{text}]({raw_destination})")
+                else:
+                    pieces.append(text)
+                if close_style:
+                    pieces.append(close_style)
+                pieces.append(match.group(0))
+                if open_style:
+                    pieces.append(open_style)
+                cursor = match.end()
+            text = inline_source[cursor:label_end]
+            if text.strip():
+                pieces.append(f"[{text}]({raw_destination})")
+            else:
+                pieces.append(text)
+            if not has_link_text:
+                pieces.append(f"[打开链接]({raw_destination})")
+            edits.append((inline_position + edit_start, inline_position + edit_end, "".join(pieces)))
+
+    for start, end, replacement in sorted(edits, reverse=True):
+        value = value[:start] + replacement + value[end:]
     return value
 
 
@@ -666,13 +840,19 @@ class FeishuRenderer:
             markdown = _convert_feishu_markdown(body, article.canonical_url)
             spans = _inline_image_spans(markdown)
             replacements: list[tuple[int, int, str]] = []
+            placeholder_styles: dict[str, tuple[str, ...]] = {}
             cursor = 0
             media_by_url = {item.url: item for item in media if item.url}
-            for start, end, url, alt, styles in spans:
+            for start, end, url, alt, styles, raw_destination, inside_link, outer_styles in spans:
                 item = media_by_url.get(url, ContentBlock("image", url=url, attrs={"alt": alt}))
                 used_urls.add(url)
                 label = str(item.attrs.get("alt") or alt or "查看原图")
-                replacement = f"[{label}]({url})"
+                escaped_label = _escape_markdown_label(label)
+                replacement = (
+                    f"[图片：{escaped_label}]({raw_destination})"
+                    if send_as_media
+                    else f"[{escaped_label}]({raw_destination})"
+                )
                 if send_as_media:
                     if url in self._image_keys:
                         key = self._image_keys[url]
@@ -686,19 +866,25 @@ class FeishuRenderer:
                     if key:
                         token = f"\ufff0FEISHUIMG{len(self._image_tokens)}\ufff1"
                         self._image_tokens[token] = await self._image_element(target, item, key)
+                        if outer_styles:
+                            placeholder_styles[token] = outer_styles
                         replace_start, replace_end, replacement = _styled_image_replacement(
                             markdown, start, end, token, styles
                         )
                         start, end = replace_start, replace_end
                     else:
-                        replacement = f"[图片：{label}]({url})"
+                        replacement = f"图片：{escaped_label}" if inside_link else replacement
+                elif inside_link:
+                    # Preserve the enclosing article/claim link as the only
+                    # link around this text. Nested Markdown links are invalid.
+                    replacement = f"图片：{escaped_label}" if send_as_media else escaped_label
                 if end > cursor:
                     replacements.append((start, end, replacement))
                     cursor = end
 
             for start, end, replacement in reversed(replacements):
                 markdown = markdown[:start] + replacement + markdown[end:]
-            markdown = _split_links_around_placeholders(markdown)
+            markdown = _split_links_around_placeholders(markdown, placeholder_styles)
             elements.extend(_expand_image_tokens(markdown, self._image_tokens))
 
         # Metadata-only media follows body media in the canonical order from

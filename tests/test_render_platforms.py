@@ -12,10 +12,21 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1].parent))
 
 from astrbot_plugin_rss.core.config import PluginConfig
 from astrbot_plugin_rss.core.models import Article, ContentBlock, DeliveryTarget, FetchResult
-from astrbot_plugin_rss.normalizers.markdown_content import article_markdown, article_media, html_to_markdown
+from astrbot_plugin_rss.normalizers.markdown_content import (
+    article_markdown,
+    article_media,
+    html_to_markdown,
+    markdown_tokens,
+)
 from astrbot_plugin_rss.parsers.feed_parser import FeedParser
 from astrbot_plugin_rss.renderers.default import DefaultRenderer, _utf16_length, article_text
-from astrbot_plugin_rss.renderers.feishu import HARD_LIMIT, FeishuRenderer, _convert_feishu_markdown
+from astrbot_plugin_rss.renderers.feishu import (
+    HARD_LIMIT,
+    FeishuRenderer,
+    _convert_feishu_markdown,
+    _inline_image_spans,
+    _split_links_around_placeholders,
+)
 from astrbot_plugin_rss.renderers.registry import RendererRegistry
 from astrbot_plugin_rss.renderers.telegram import TelegramRenderer, _telegraph_markdown_nodes
 
@@ -696,6 +707,107 @@ async def test_feishu_image_upload_failure_keeps_one_chinese_source_link() -> No
     body = "\n".join(element.get("content", "") for element in message.payload["card"]["body"]["elements"])
     assert body.count("https://example.org/p.png") == 1
     assert "[图片：图片一](https://example.org/p.png)" in body
+
+
+def test_feishu_placeholder_link_split_stays_inside_its_parsed_link() -> None:
+    first = "\ufff0FEISHUIMG0\ufff1"
+    second = "\ufff0FEISHUIMG1\ufff1"
+    separated = "[官网](https://agentin.one)\n\n界面UI一览：\n\n" + first + "\n\n[后续](https://after.example)"
+    assert _split_links_around_placeholders(separated) == separated
+
+    same_paragraph = (
+        "[前](https://before.example) `[代码](https://code.example)` "
+        f"[caption {first} 中 {second} end](https://target.example) "
+        "[后](https://after.example)"
+    )
+    split = _split_links_around_placeholders(same_paragraph)
+    assert split == (
+        "[前](https://before.example) `[代码](https://code.example)` "
+        f"[caption ](https://target.example){first}"
+        f"[ 中 ](https://target.example){second}[ end](https://target.example) "
+        "[后](https://after.example)"
+    )
+
+
+def test_feishu_linked_image_with_quoted_parenthesis_titles_stays_locatable() -> None:
+    image_url = "https://cdn.example.org/photo(path).png"
+    destination = '"caption ) title"'
+    markdown = f'[![photo]({image_url} {destination})](<https://example.org/claim(path)> "claim ) title")'
+    [span] = _inline_image_spans(markdown)
+    assert markdown[span[0] : span[1]] == f"![photo]({image_url} {destination})"
+    assert span[2] == image_url
+    assert span[5] == image_url + " " + destination
+    assert span[6] is True
+
+    placeholder = "\ufff0FEISHUIMG0\ufff1"
+    replaced = markdown[: span[0]] + placeholder + markdown[span[1] :]
+    split = _split_links_around_placeholders(replaced)
+    assert split == placeholder + '[打开链接](<https://example.org/claim(path)> "claim ) title")'
+
+
+async def test_feishu_svg_image_fallback_uses_enclosing_page_link_and_keeps_order() -> None:
+    claim_url = "https://hb.unsnow.org/hb/4fc8845e2f92adb01cf47e220b3a3932"
+    image_url = "https://cdn.example.org/card%20preview.svg"
+    blocks = markdown_blocks_from_html(
+        '<p>领取入口：<a href="'
+        + claim_url
+        + '"><img src="'
+        + image_url
+        + '" alt="红包卡片 [领取]"></a>，领取后查看状态</p>'
+        '<p><img src="https://cdn.example.org/standalone%20preview.svg" alt="图 [预览]"></p>'
+        '<p><a href="https://after.example">阅读完整话题</a></p>'
+    )
+    item = article("svg-fallback", blocks)
+
+    async def unavailable(_target, _url, _alt):
+        return None
+
+    [message] = await FeishuRenderer(image_key=unavailable).render([item], target(), "源")
+    elements = message.payload["card"]["body"]["elements"]
+    body = "\n".join(element.get("content", "") for element in elements)
+    assert "领取入口：[图片：红包卡片 \\[领取\\]](" + claim_url + ")，领取后查看状态" in body
+    assert "[后续]" not in body
+    assert "[阅读完整话题](https://after.example)" in body
+    assert image_url not in body
+    assert "[图片：图 \\[预览\\]](https://cdn.example.org/standalone%20preview.svg)" in body
+    assert body.index("领取入口") < body.index("阅读完整话题")
+
+
+async def test_feishu_uploaded_image_inside_strong_link_keeps_each_markdown_element_balanced() -> None:
+    claim_url = "https://example.org/claim"
+    image_url = "https://cdn.example.org/image.png"
+
+    async def uploaded(_target, _url, _alt):
+        return "image-key"
+
+    for html in (
+        '<p><strong><a href="' + claim_url + '">before<img src="' + image_url + '" alt="photo">after</a></strong></p>',
+        '<p><a href="' + claim_url + '"><strong>before<img src="' + image_url + '" alt="photo">after</strong></a></p>',
+        '<p><strong>leading <a href="'
+        + claim_url
+        + '">before<img src="'
+        + image_url
+        + '" alt="photo">after</a> trailing</strong></p>',
+    ):
+        [message] = await FeishuRenderer(image_key=uploaded).render(
+            [article("strong-link-image", markdown_blocks_from_html(html))], target(), "源"
+        )
+        elements = message.payload["card"]["body"]["elements"]
+        markdown = [element.get("content", "") for element in elements if element.get("tag") == "markdown"]
+        image_index = next(index for index, element in enumerate(elements) if element.get("tag") == "img")
+        assert elements[image_index]["img_key"] == "image-key"
+        assert "before" in markdown[0] and claim_url in markdown[0]
+        assert "after" in markdown[1] and claim_url in markdown[1]
+        for fragment in markdown[:2]:
+            children = [
+                child for block in markdown_tokens(fragment) if block.type == "inline" for child in block.children or []
+            ]
+            strong_open = sum(child.type == "strong_open" for child in children)
+            assert strong_open > 0
+            assert strong_open == sum(child.type == "strong_close" for child in children)
+            link_open = sum(child.type == "link_open" for child in children)
+            assert link_open > 0
+            assert link_open == sum(child.type == "link_close" for child in children)
 
 
 async def test_feishu_generic_anchor_image_upload_preserves_article_href_and_text_order() -> None:
