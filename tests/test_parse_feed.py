@@ -275,6 +275,144 @@ def test_discourse_title_anchors_are_removed_but_generic_heading_links_remain():
     assert "[Linked heading](https://example.org/a#section)" in generic
 
 
+def test_feed_parser_normalizes_discourse_onebox_and_removes_only_matching_source_decorations():
+    activity_url = (
+        "https://personal-act.wps.cn/lego-act/friend-card/desktop?activity_number=fake-activity"
+        "&page_number=fake-page&token=fake-token#fake-section"
+    )
+    escaped_activity_url = activity_url.replace("&", "&amp;")
+    icon_url = "https://personal-act.wpscdn.cn/operations-fe/fe-static/img/favicon/default.ico"
+    html = f'''<aside class="onebox allowlistedgeneric" data-onebox-src="{escaped_activity_url}">
+      <header class="source"><img class="site-icon" src="{icon_url}" alt="" width="32" height="32">
+        <a href="{escaped_activity_url}">personal-act.wps.cn</a></header>
+      <article class="onebox-body"><h3><a href="{escaped_activity_url}">WPS 大会员亲友卡</a></h3></article>
+      <div class="onebox-metadata"></div><div style="clear: both"></div></aside>
+      <p>4 posts - 4 participants</p><p><a href="https://linux.do/t/topic/42">Read full topic</a></p>'''
+    xml = (
+        "<rss><channel><title>Forum</title><item><guid>onebox-entry</guid><title>Forum post</title>"
+        "<link>https://linux.do/t/topic/42/1</link><description><![CDATA["
+        + html
+        + "]]></description></item></channel></rss>"
+    ).encode()
+
+    article = parse_xml(xml, "https://linux.do/c/feedback/42.rss").articles[0]
+    markdown = body(article)
+
+    assert f"[WPS 大会员亲友卡]({activity_url})" in markdown
+    assert markdown.count(activity_url) == 1
+    assert "[personal-act.wps.cn]" not in markdown
+    assert icon_url not in markdown
+    assert all(item.get("url") != icon_url for item in article.metadata["media"])
+    assert "4 posts - 4 participants" not in markdown
+    assert "Read full topic" not in markdown
+
+
+def test_onebox_cleanup_keeps_summary_images_and_other_links_in_order():
+    activity_url = "https://personal-act.wps.cn/lego-act/friend-card/desktop?token=fake-token"
+    icon_url = "https://static.example.org/site-icon.ico"
+    preview_url = "https://static.example.org/card-preview.jpg"
+    other_url = "https://personal-act.wps.cn/terms"
+    html = f'''<aside class="onebox allowlistedgeneric" data-onebox-src="{activity_url}">
+      <header class="source"><a href="{activity_url}"><img class="site-icon" src="{icon_url}" alt="">
+        personal-act.wps.cn</a><span class="onebox-author">Shared by Editor · Oct 30</span></header>
+      <article class="onebox-body"><h3><a href="{activity_url}">Card title</a></h3>
+        <p>Useful summary with <a href="{other_url}">terms</a>.</p>
+        <p><img src="{preview_url}" alt="Preview"></p></article></aside>'''
+    media = []
+
+    markdown = html_to_markdown(html, "https://forum.example/t/thread/9", media=media)
+
+    assert markdown.index("[Card title]") < markdown.index("Useful summary")
+    assert "Useful summary" in markdown
+    assert "Shared by Editor · Oct 30" in markdown
+    assert f"[terms]({other_url})" in markdown
+    assert f"![Preview]({preview_url})" in markdown
+    assert markdown.count(activity_url) == 1
+    assert icon_url not in markdown
+    assert [item["url"] for item in media] == [preview_url]
+
+
+@pytest.mark.parametrize(
+    ("source_href", "title_href", "source_label"),
+    [
+        (
+            "https://personal-act.wps.cn/source?token=fake-token",
+            "https://personal-act.wps.cn/target?token=fake-token",
+            "personal-act.wps.cn",
+        ),
+        (
+            "https://personal-act.wps.cn/target?token=fake-token",
+            "https://personal-act.wps.cn/target?token=fake-token",
+            "Open the activity details",
+        ),
+        (
+            "https://personal-act.wps.cn/target?token=fake-token",
+            None,
+            "personal-act.wps.cn",
+        ),
+        (
+            "https://personal-act.wps.cn/target?token=fake-token",
+            "javascript:alert(1)",
+            "personal-act.wps.cn",
+        ),
+        (
+            "https://personal-act.wps.cn/target?token=fake-token",
+            "https://personal-act.wps.cn/target?token=fake-token",
+            "personal-act.wps.cn source note",
+        ),
+    ],
+)
+def test_onebox_cleanup_falls_back_for_mismatched_or_descriptive_sources(
+    source_href: str, title_href: str | None, source_label: str
+):
+    icon_url = "https://static.example.org/site-icon.ico"
+    title_link = f'<a href="{title_href}">Card title</a>' if title_href is not None else "<a>Card title</a>"
+    html = f'''<aside class="onebox allowlistedgeneric" data-onebox-src="{source_href}">
+      <header class="source"><a href="{source_href}"><img class="site-icon" src="{icon_url}" alt="">{source_label}</a></header>
+      <article class="onebox-body"><h3>{title_link}</h3></article></aside>'''
+    media = []
+
+    markdown = html_to_markdown(html, "https://forum.example/t/thread/9", media=media)
+
+    assert icon_url in markdown
+    assert any(item.get("url") == icon_url for item in media)
+    assert "Card title" in markdown
+    assert source_label in markdown
+
+
+def test_onebox_cleanup_ignores_a_title_link_inside_a_hidden_template():
+    source_url = "https://personal-act.wps.cn/target?token=fake-token"
+    icon_url = "https://static.example.org/site-icon.ico"
+    html = f'''<aside class="onebox allowlistedgeneric" data-onebox-src="{source_url}">
+      <header class="source"><a href="{source_url}"><img class="site-icon" src="{icon_url}" alt="">personal-act.wps.cn</a></header>
+      <article class="onebox-body"><template><h3><a href="{source_url}">Hidden title</a></h3></template></article>
+    </aside>'''
+    media = []
+
+    markdown = html_to_markdown(html, "https://forum.example/t/thread/9", media=media)
+
+    assert source_url in markdown and "personal-act.wps.cn" in markdown
+    assert icon_url in markdown
+    assert "Hidden title" not in markdown
+    assert any(item.get("url") == icon_url for item in media)
+
+
+def test_onebox_cleanup_does_not_filter_ordinary_domain_links_or_small_images():
+    source_url = "https://personal-act.wps.cn/target?token=fake-token"
+    icon_url = "https://static.example.org/site-icon.ico"
+    html = (
+        f'<p><a href="{source_url}">personal-act.wps.cn</a> '
+        f'<img class="site-icon" src="{icon_url}" alt="Icon" width="16" height="16"></p>'
+    )
+    media = []
+
+    markdown = html_to_markdown(html, "https://forum.example/t/thread/9", media=media)
+
+    assert f"[personal-act.wps.cn]({source_url})" in markdown
+    assert f"![Icon]({icon_url})" in markdown
+    assert any(item.get("url") == icon_url for item in media)
+
+
 def test_feed_date_failures_and_entities_do_not_break_article_metadata():
     xml = b"""<rss><channel><title>Feed &amp; News</title><item><guid>x</guid><title>Item</title>
       <link>https://example.org/item</link><pubDate>not a date</pubDate><description><![CDATA[<p>A &amp; B</p>]]></description>

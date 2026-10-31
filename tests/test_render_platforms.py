@@ -144,6 +144,39 @@ async def test_html_promotion_renders_bold_and_inline_gift_in_all_platforms(send
     assert nodes[1] == {"tag": "p", "children": ["🎁 ", {"tag": "strong", "children": ["进群送 5 刀体验额度"]}]}
 
 
+async def test_default_and_feishu_render_onebox_with_only_the_title_destination():
+    activity_url = (
+        "https://personal-act.wps.cn/lego-act/friend-card/desktop?activity_number=fake-activity"
+        "&page_number=fake-page&token=fake-token"
+    )
+    escaped_activity_url = activity_url.replace("&", "&amp;")
+    icon_url = "https://personal-act.wpscdn.cn/operations-fe/fe-static/img/favicon/default.ico"
+    html = f'''<aside class="onebox allowlistedgeneric" data-onebox-src="{escaped_activity_url}">
+      <header class="source"><img class="site-icon" src="{icon_url}" alt="" width="32" height="32">
+        <a href="{escaped_activity_url}">personal-act.wps.cn</a></header>
+      <article class="onebox-body"><h3><a href="{escaped_activity_url}">WPS 大会员亲友卡</a></h3></article></aside>'''
+    item = article(
+        "onebox-render",
+        markdown_blocks_from_html(html, "https://example.org/onebox-post"),
+        title="Forum post",
+    )
+
+    [default] = await DefaultRenderer().render([item], target("other"), "源")
+    default_text = "\n".join(str(part.get("text", "")) for part in default.payload["parts"])
+    [feishu] = await FeishuRenderer().render([item], target(), "源")
+    feishu_text = "\n".join(
+        element.get("content", "")
+        for element in feishu.payload["card"]["body"]["elements"]
+        if element.get("tag") == "markdown"
+    )
+
+    for rendered in (default_text, feishu_text):
+        assert rendered.count(activity_url) == 1
+        assert "WPS 大会员亲友卡" in rendered
+        assert "[personal-act.wps.cn](" not in rendered
+        assert icon_url not in rendered
+
+
 async def test_cached_gift_is_inline_but_real_small_and_custom_images_stay_media():
     cached = article(
         "cached-inline",

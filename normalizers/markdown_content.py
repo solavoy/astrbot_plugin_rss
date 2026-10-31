@@ -71,6 +71,33 @@ def _classes(tag: Any) -> set[str]:
     return {str(item).casefold() for item in value}
 
 
+def _is_hostname_or_url_label(label: str, destination: str) -> bool:
+    compact = " ".join(str(label or "").split())
+    if not compact or any(char.isspace() for char in compact):
+        return False
+    try:
+        target = urlsplit(destination)
+        if not target.hostname:
+            return False
+        if compact.casefold().startswith(("http://", "https://")):
+            candidate = _safe_url(compact)
+            if not candidate:
+                return False
+            parsed = urlsplit(candidate)
+            if _url_key(candidate) == _url_key(destination):
+                return True
+            if parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
+                return False
+        else:
+            candidate_text = compact.removesuffix("/")
+            if any(char in candidate_text for char in "/?#@"):
+                return False
+            parsed = urlsplit(f"//{candidate_text}")
+        return parsed.hostname.casefold().rstrip(".") == target.hostname.casefold().rstrip(".")
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+
 def _dimension(value: object) -> int | None:
     if value is None:
         return None
@@ -216,6 +243,8 @@ class _FeedMarkdownConverter(MarkdownConverter):
         self.base_url = base_url
         self.media = media
         self.is_discourse = is_discourse
+        self._onebox_source_anchors: set[int] = set()
+        self._onebox_site_icons: set[int] = set()
         super().__init__(
             heading_style="ATX",
             bullets="-",
@@ -240,7 +269,12 @@ class _FeedMarkdownConverter(MarkdownConverter):
     def process_tag(self, node, parent_tags=None):
         # markdownify's strip option skips tag conversion but keeps child text.
         # Drop active/hidden subtrees in this narrow converter hook instead.
-        if str(getattr(node, "name", "") or "").casefold() in {
+        name = str(getattr(node, "name", "") or "").casefold()
+        if name == "aside":
+            self._mark_redundant_onebox_source(node)
+        if id(node) in self._onebox_source_anchors or id(node) in self._onebox_site_icons:
+            return ""
+        if name in {
             "script",
             "style",
             "noscript",
@@ -253,6 +287,56 @@ class _FeedMarkdownConverter(MarkdownConverter):
         }:
             return ""
         return super().process_tag(node, parent_tags=parent_tags)
+
+    def _mark_redundant_onebox_source(self, node: Any) -> None:
+        if "onebox" not in _classes(node):
+            return
+        headers = [item for item in node.find_all("header") if "source" in _classes(item)]
+        bodies = [item for item in node.find_all("article") if "onebox-body" in _classes(item)]
+        if len(headers) != 1 or len(bodies) != 1:
+            return
+
+        headings = [item for item in bodies[0].find_all(re.compile(r"^h[1-6]$", re.I))]
+        title_anchors = [anchor for heading in headings for anchor in heading.find_all("a", href=True)]
+        source_anchors = headers[0].find_all("a", href=True)
+        if len(title_anchors) != 1 or len(source_anchors) != 1:
+            return
+
+        title_anchor = title_anchors[0]
+        source_anchor = source_anchors[0]
+        if title_anchor.find_parent(
+            ["script", "style", "noscript", "template", "svg", "form", "input", "button", "source"]
+        ):
+            return
+        title_url = _safe_url(title_anchor.get("href"), self.base_url)
+        source_url = _safe_url(source_anchor.get("href"), self.base_url)
+        if not title_url or not source_url or not title_anchor.get_text(" ", strip=True):
+            return
+        if _url_key(title_url) != _url_key(source_url):
+            return
+
+        onebox_url = node.get("data-onebox-src")
+        if onebox_url is not None:
+            resolved_onebox_url = _safe_url(onebox_url, self.base_url)
+            if not resolved_onebox_url or _url_key(resolved_onebox_url) != _url_key(title_url):
+                return
+
+        source_label = source_anchor.get_text(" ", strip=True)
+        if not _is_hostname_or_url_label(source_label, source_url):
+            return
+
+        # The source anchor is only decorative when it contains its host/URL
+        # label and site icons; retain any richer source content as supplied.
+        for child in source_anchor.find_all(True):
+            if child.name == "img" and "site-icon" in _classes(child):
+                continue
+            if child.name not in {"span", "b", "strong", "em", "i", "small"}:
+                return
+
+        self._onebox_source_anchors.add(id(source_anchor))
+        for icon in headers[0].find_all("img"):
+            if "site-icon" in _classes(icon):
+                self._onebox_site_icons.add(id(icon))
 
     def _record(self, url: str, *, medium: str, tag: Any, mime_type: str = "") -> None:
         if not url:
