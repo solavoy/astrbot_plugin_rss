@@ -12,9 +12,17 @@ DIST = ROOT / "views" / "rss"
 BRIDGE = r"""<script>
 let darkMode=false,contextHandlers=[];
 let harnessFeed={public_id:41,feed_id:'internal-feed-uuid',url:'https://example.invalid/rss.xml',title:'Harness Example',enabled:true,poll_interval:300,translation_enabled:false,last_fetch_at:Date.now()/1000};
+const translationFixture={article_id:'demo-article',feed_id:'internal-feed-uuid',status:'partial',reason:'timeout',reasons:['timeout'],segments_total:3,segments_translated:1,segments_skipped:0,segments_unchanged:0,segments_failed:1};
+const testOperationFixture={operation_id:'harness-operation',target_id:'test-target',target_label:'Harness chat',status:'success',error:null,created_at:Date.now()/1000,updated_at:Date.now()/1000,translation_diagnostics:[translationFixture]};
 window.AstrBotPluginView={ready:async()=>({displayName:'RSS UI Harness · TEST DATA',isDark:darkMode}),
  getContext:()=>({isDark:darkMode}),onContext:handler=>{contextHandlers.push(handler);return()=>{contextHandlers=contextHandlers.filter(item=>item!==handler)}},
- apiGet:async(endpoint,params={})=>window.__harnessGet(endpoint,params),
+ apiGet:async(endpoint,params={})=>{
+  const result=window.__harnessGet(endpoint,params);
+  if(endpoint==='deliveries')for(const item of result.items||[])item.translation_diagnostics=[translationFixture];
+  if(endpoint==='deliveries/demo-delivery'&&result.delivery)result.delivery.translation_diagnostics=[translationFixture];
+  if(endpoint.startsWith('feeds/')&&Number(endpoint.split('/')[1])===Number(harnessFeed.public_id))result.test_operations=[testOperationFixture];
+  return result;
+ },
  apiPost:async(endpoint,body={})=>window.__harnessPost(endpoint,body),
  upload:async(endpoint,file)=>endpoint==='data/import'?({feeds_imported:1,skipped_unregistered_targets:1}):({ok:true,endpoint,filename:file.name}),
  download:async(endpoint,params,name)=>({filename:name||endpoint})};
@@ -44,7 +52,7 @@ window.__harnessPost=async(endpoint,body={})=>{
   return {ok:true,feed:{...harnessFeed}};
  }
  if(endpoint.endsWith('/preview'))return {preview_only:true,article_count:1,messages:[{renderer:'default',message_type:'parts',article_ids:['demo-article'],payload:{parts:[{type:'text',text:'Harness Example\n**Test fixture article**\nThis is preview-only sample content.'},{type:'text',text:'Open original' ,url:'https://example.invalid/article'}]}}]};
- if(endpoint.endsWith('/test'))return {operation_id:'harness-operation',status:'success',target_id:'test-target'};
+ if(endpoint.endsWith('/test'))return {operation_id:'harness-operation',status:'success',target_id:'test-target',translation_diagnostics:[translationFixture]};
  if(endpoint.endsWith('/refresh'))return {status:'ok',new_articles:0};
  return {ok:true,test_harness:true,endpoint,body};
 };

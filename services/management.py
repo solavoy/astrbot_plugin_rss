@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import re
 import secrets
@@ -21,7 +22,7 @@ from ..core.feed_urls import build_feed_request, is_relative_feed_reference, nor
 from ..core.security import validate_public_url
 from ..storage.database import Database
 from ..storage.interval_inputs import attach_interval_inputs, interval_input_text, save_interval_input
-from ..storage.management_repository import ManagementRepository
+from ..storage.management_repository import ManagementRepository, _decode_translation_diagnostics
 from .facade import normalize_poll_interval
 
 
@@ -43,19 +44,28 @@ class ManagementService:
             try:
                 selected_day = date.fromisoformat(raw)
                 zone = ZoneInfo(self.timezone)
-            except (ValueError, ZoneInfoNotFoundError):
+                if key == "date_to":
+                    selected_day += timedelta(days=1)
+            except (OverflowError, ValueError, ZoneInfoNotFoundError):
                 raise ValueError(f"{key} must be a date in the configured time zone") from None
             if key == "date_to":
-                selected_day += timedelta(days=1)
                 operator = "<"
             else:
                 operator = ">="
-            boundary = datetime.combine(selected_day, datetime_time.min, tzinfo=zone)
-            return operator, boundary.timestamp()
+            try:
+                boundary = datetime.combine(selected_day, datetime_time.min, tzinfo=zone)
+                stamp = boundary.timestamp()
+            except (OverflowError, OSError, ValueError):
+                raise ValueError(f"{key} must be a date in the configured time zone") from None
+            if not math.isfinite(stamp):
+                raise ValueError(f"{key} must be a date in the configured time zone")
+            return operator, stamp
         try:
             stamp = float(value)
         except (TypeError, ValueError):
             raise ValueError(f"{key} must be a timestamp or YYYY-MM-DD date") from None
+        if not math.isfinite(stamp):
+            raise ValueError(f"{key} must be a finite timestamp or YYYY-MM-DD date")
         return (">=" if key == "date_from" else "<="), stamp
 
     async def _validated_feed_reference(self, reference: str) -> str:
@@ -117,6 +127,7 @@ class ManagementService:
             result = await self.read.feed_detail(feed_id)
             if result is None:
                 raise KeyError(feed_id)
+            result["test_operations"] = await self.read.recent_test_operations(feed_id)
             for article in result["articles"]:
                 try:
                     article["content_blocks"] = json.loads(article["content_blocks"])
@@ -192,6 +203,8 @@ class ManagementService:
                 + " ORDER BY d.created_at DESC,d.rowid DESC"
             )
             result = await self.read.page(sql, tuple(args), page, size)
+            for item in result["items"]:
+                item["translation_diagnostics"] = _decode_translation_diagnostics(item.get("translation_diagnostics"))
             result["timezone"] = self.timezone
             return result
         if endpoint.startswith("deliveries/") and endpoint.count("/") == 1:
@@ -286,14 +299,7 @@ class ManagementService:
         detail = await self.read.list_detail(list_id)
         if detail is None:
             raise KeyError(list_id)
-        rows = await self.runtime.database.fetchall(
-            "SELECT article_id FROM articles WHERE feed_id IN "
-            "(SELECT feed_id FROM list_feeds WHERE list_id=?) "
-            "ORDER BY COALESCE(published_at,updated_at,first_seen_at) DESC,seq DESC,article_id DESC LIMIT 20",
-            (list_id,),
-        )
-        articles = await asyncio.gather(*(self.runtime.repository.article(row["article_id"]) for row in rows))
-        articles = [article for article in articles if article is not None]
+        articles = await self.runtime.repository.articles_for_list(list_id, limit=20)
         target = await self._preview_target(target_id)
         list_data = detail["list"]
         messages = (
@@ -489,8 +495,10 @@ class ManagementService:
             kind = body.get("kind")
             if kind not in {"articles", "history", "cookies", "media", "all"}:
                 raise ValueError("unsupported cleanup kind")
-            if kind in {"articles", "history", "all"}:
+            if kind in {"articles", "history"}:
                 return await self.services.data.cleanup(kind)
+            if kind == "all":
+                return await self.runtime.run_maintenance_once()
             if kind == "cookies":
                 manager = getattr(self.runtime.fetcher, "cookies", None)
                 return {"removed": manager.clear_expired() if manager else 0}
@@ -1110,6 +1118,77 @@ class ManagementService:
                     actual = {row[1] for row in check.execute(f"PRAGMA table_info({table})")}
                     if not expected <= actual:
                         raise ValueError(f"backup table {table} is missing required columns")
+                safe_translation_statuses = {
+                    "disabled",
+                    "provider_missing",
+                    "skipped",
+                    "translated",
+                    "partial",
+                    "failed",
+                }
+                safe_translation_reason = re.compile(r"^[a-z0-9_]{1,64}$")
+                allowed_diagnostic_fields = {
+                    "article_id",
+                    "feed_id",
+                    "status",
+                    "reason",
+                    "reasons",
+                    "segments_total",
+                    "segments_translated",
+                    "segments_skipped",
+                    "segments_unchanged",
+                    "segments_failed",
+                }
+                for table in ("deliveries", "test_operations"):
+                    info = {row[1]: row for row in check.execute(f"PRAGMA table_info({table})")}
+                    column = info.get("translation_diagnostics")
+                    if column is None:
+                        continue
+                    if column[2].upper() != "TEXT" or column[3] != 1 or column[4] not in {"'[]'", '"[]"'}:
+                        raise ValueError(f"backup table {table} has an invalid translation_diagnostics column")
+                    for (raw_diagnostics,) in check.execute(f"SELECT translation_diagnostics FROM {table}"):
+                        try:
+                            diagnostics = json.loads(raw_diagnostics)
+                        except (TypeError, ValueError) as exc:
+                            raise ValueError("backup translation diagnostics are invalid JSON") from exc
+                        if not isinstance(diagnostics, list) or len(diagnostics) > 100:
+                            raise ValueError("backup translation diagnostics must be a bounded list")
+                        for diagnostic in diagnostics:
+                            if (
+                                not isinstance(diagnostic, dict)
+                                or set(diagnostic) - allowed_diagnostic_fields
+                                or diagnostic.get("status") not in safe_translation_statuses
+                            ):
+                                raise ValueError("backup translation diagnostics contain unsupported fields")
+                            for key in ("article_id", "feed_id"):
+                                value = diagnostic.get(key)
+                                if value is not None and (not isinstance(value, str) or len(value) > 200):
+                                    raise ValueError("backup translation diagnostic identifiers are invalid")
+                            reason = diagnostic.get("reason")
+                            if reason is not None and (
+                                not isinstance(reason, str) or not safe_translation_reason.fullmatch(reason)
+                            ):
+                                raise ValueError("backup translation diagnostic reason is invalid")
+                            reasons = diagnostic.get("reasons", [])
+                            if (
+                                not isinstance(reasons, list)
+                                or len(reasons) > 20
+                                or any(
+                                    not isinstance(value, str) or not safe_translation_reason.fullmatch(value)
+                                    for value in reasons
+                                )
+                            ):
+                                raise ValueError("backup translation diagnostic reasons are invalid")
+                            for key in (
+                                "segments_total",
+                                "segments_translated",
+                                "segments_skipped",
+                                "segments_unchanged",
+                                "segments_failed",
+                            ):
+                                value = diagnostic.get(key)
+                                if type(value) is not int or not 0 <= value <= 1_000_000:
+                                    raise ValueError("backup translation diagnostic segment counts are invalid")
                 invalid_translation_flags = check.execute(
                     "SELECT COUNT(*) FROM feeds WHERE typeof(translation_enabled)!='integer' "
                     "OR translation_enabled NOT IN (0,1)"
@@ -1163,6 +1242,9 @@ class ManagementService:
                             sorted(
                                 (row[1], row[2], row[3], row[4], row[5])
                                 for row in connection.execute(f"PRAGMA table_info({table})")
+                                if not (
+                                    table in {"deliveries", "test_operations"} and row[1] == "translation_diagnostics"
+                                )
                             )
                         )
                         indexes = tuple(

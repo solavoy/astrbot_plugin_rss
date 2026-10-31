@@ -471,6 +471,27 @@ class Repository:
         )
         return self._article(row) if row else None
 
+    async def articles_for_feed(self, feed_id: str, limit: int = 100) -> list[Article]:
+        rows = await self.db.fetchall(
+            "SELECT a.*,COALESCE(NULLIF(f.title,''),f.url) feed_title "
+            "FROM articles a JOIN feeds f USING(feed_id) WHERE a.feed_id=? "
+            "ORDER BY COALESCE(a.published_at,a.updated_at,a.first_seen_at) DESC,"
+            "a.seq DESC,a.article_id DESC LIMIT ?",
+            (feed_id, limit),
+        )
+        return [self._article(row) for row in rows]
+
+    async def articles_for_list(self, list_id: str, limit: int = 100) -> list[Article]:
+        rows = await self.db.fetchall(
+            "SELECT a.*,COALESCE(NULLIF(f.title,''),f.url) feed_title "
+            "FROM articles a JOIN feeds f USING(feed_id) "
+            "JOIN list_feeds lf USING(feed_id) WHERE lf.list_id=? "
+            "ORDER BY COALESCE(a.published_at,a.updated_at,a.first_seen_at) DESC,"
+            "a.seq DESC,a.article_id DESC LIMIT ?",
+            (list_id, limit),
+        )
+        return [self._article(row) for row in rows]
+
     @staticmethod
     def _article(row) -> Article:
         return Article(
@@ -655,6 +676,36 @@ class Repository:
             ).fetchall()
         return [dict(r) for r in rows]
 
+    async def release_unattempted_deliveries(self, delivery_ids: list[str]) -> None:
+        """Requeue unfinished claims without charging for cards that were not processed."""
+        if not delivery_ids:
+            return
+        placeholders = ",".join("?" for _ in delivery_ids)
+        async with self.db.transaction() as conn:
+            await conn.execute(
+                f"UPDATE deliveries SET status='pending',attempts=MAX(attempts-1,0),next_attempt_at=0,error=NULL,updated_at=? "
+                f"WHERE delivery_id IN ({placeholders}) AND status IN ('rendering','sending','pending')",
+                (now_ts(), *delivery_ids),
+            )
+
+    async def fail_claimed_delivery(self, delivery_id: str, error: str, *, max_attempts: int, retry_at: float) -> bool:
+        """Record a render/pre-send failure and stop retries once its claim budget is exhausted."""
+        now = now_ts()
+        async with self.db.transaction() as conn:
+            cursor = await conn.execute(
+                "UPDATE deliveries SET status='failed',retryable=CASE WHEN attempts>=? THEN 0 ELSE 1 END,"
+                "error=?,next_attempt_at=CASE WHEN attempts>=? THEN 0 ELSE ? END,updated_at=? "
+                "WHERE delivery_id=? AND status IN ('rendering','sending','pending')",
+                (max_attempts, error[:500], max_attempts, retry_at, now, delivery_id),
+            )
+            if cursor.rowcount:
+                await conn.execute(
+                    "INSERT INTO delivery_attempts(delivery_id,attempted_at,result,error,platform_message_id) "
+                    "VALUES(?,?,?,?,NULL)",
+                    (delivery_id, now, "failed", error[:500]),
+                )
+        return cursor.rowcount == 1
+
     async def delivery(self, delivery_id: str) -> dict[str, Any] | None:
         row = await self.db.fetchone("SELECT * FROM deliveries WHERE delivery_id=?", (delivery_id,))
         return dict(row) if row else None
@@ -770,6 +821,13 @@ class Repository:
         for table in tables:
             data[table] = [dict(r) for r in await self.db.fetchall(f"SELECT * FROM {table}")]
         return data
+
+    async def set_delivery_translation_diagnostics(self, delivery_id: str, diagnostics: dict[str, Any]) -> None:
+        async with self.db.transaction() as conn:
+            await conn.execute(
+                "UPDATE deliveries SET translation_diagnostics=? WHERE delivery_id=?",
+                (_json([diagnostics]), delivery_id),
+            )
 
     async def mark_delivery(
         self,
@@ -1069,7 +1127,21 @@ class Repository:
             return None
         result = dict(row)
         result["article_ids"] = json.loads(result["article_ids"])
+        try:
+            diagnostics = json.loads(result.get("translation_diagnostics") or "[]")
+        except (TypeError, ValueError):
+            diagnostics = []
+        result["translation_diagnostics"] = diagnostics if isinstance(diagnostics, list) else []
         return result
+
+    async def set_test_operation_translation_diagnostics(
+        self, operation_id: str, diagnostics: list[dict[str, Any]]
+    ) -> None:
+        async with self.db.transaction() as conn:
+            await conn.execute(
+                "UPDATE test_operations SET translation_diagnostics=? WHERE operation_id=?",
+                (_json(diagnostics), operation_id),
+            )
 
     async def update_test_operation(self, operation_id: str, status: str, error: str | None = None) -> None:
         async with self.db.transaction() as conn:

@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 import time
 import uuid
-from collections import deque
+from collections import OrderedDict, deque
 from dataclasses import replace
 from pathlib import Path
 
 from ..storage import Database, Repository
 from .config import PluginConfig, normalize_translation_prompt
 from .models import Article, DeliveryTarget, RenderedMessage, now_ts
+
+logger = logging.getLogger(__name__)
 
 
 class RSSRuntime:
@@ -36,32 +39,94 @@ class RSSRuntime:
         self._send_rate_lock = asyncio.Lock()
         self._feed_refresh_locks: dict[str, asyncio.Lock] = {}
         self._feed_refresh_generations: dict[str, int] = {}
-        self._translation_cache: dict[tuple[str, str, bool, str, str, str], Article] = {}
+        self._translation_cache: OrderedDict[tuple, object] = OrderedDict()
+        self._translation_tasks: dict[tuple, asyncio.Task] = {}
 
-    async def _articles_for_render(self, articles: list[Article]) -> list[Article]:
+    async def _articles_for_render(
+        self, articles: list[Article], *, diagnostics: list[dict] | None = None
+    ) -> list[Article]:
         """Return translated Article copies for renderers, leaving stored Article data untouched."""
         provider_id = self.config.translation_provider_id
-        if not provider_id:
+        if not provider_id and self.database.connection is None:
+            if diagnostics is not None:
+                diagnostics.extend(
+                    {
+                        "article_id": article.article_id,
+                        "feed_id": article.feed_id,
+                        "status": "provider_missing",
+                        "reason": "provider_not_configured",
+                        "segments_total": 0,
+                        "segments_translated": 0,
+                        "segments_skipped": 0,
+                        "segments_unchanged": 0,
+                        "segments_failed": 0,
+                        "reasons": ["provider_not_configured"],
+                    }
+                    for article in articles
+                )
             return articles
-
         feed_translation_enabled = {}
+        feeds = {}
         for article in articles:
             if article.feed_id not in feed_translation_enabled:
                 feed = await self.repository.get_feed(article.feed_id)
+                feeds[article.feed_id] = feed
                 feed_translation_enabled[article.feed_id] = bool(
                     feed is not None and getattr(feed, "translation_enabled", False)
                 )
-        if not any(feed_translation_enabled.values()):
-            return articles
-
-        from ..services.translation import TranslationService
-
         translation_prompt = normalize_translation_prompt(self.config.translation_prompt)
-        translator = TranslationService(self.context, provider_id, prompt=translation_prompt)
+        translator = None
+        if provider_id:
+            from ..services.translation import TranslationService
+
+            translator = TranslationService(
+                self.context,
+                provider_id,
+                prompt=translation_prompt,
+                timeout_seconds=self.config.translation_timeout_seconds,
+                total_timeout_seconds=self.config.translation_total_timeout_seconds,
+                max_segment_chars=self.config.translation_max_segment_chars,
+                max_requests=self.config.translation_max_requests,
+            )
         rendered_articles = []
         for article in articles:
             if not feed_translation_enabled.get(article.feed_id, False):
                 rendered_articles.append(article)
+                if diagnostics is not None:
+                    diagnostics.append(
+                        {
+                            "article_id": article.article_id,
+                            "feed_id": article.feed_id,
+                            "status": "disabled",
+                            "reason": "feed_unavailable"
+                            if feeds.get(article.feed_id) is None
+                            else "feed_translation_disabled",
+                            "segments_total": 0,
+                            "segments_translated": 0,
+                            "segments_skipped": 0,
+                            "segments_unchanged": 0,
+                            "segments_failed": 0,
+                            "reasons": [],
+                        }
+                    )
+                continue
+            if not provider_id:
+                rendered_articles.append(article)
+                if diagnostics is not None:
+                    diagnostics.append(
+                        {
+                            "article_id": article.article_id,
+                            "feed_id": article.feed_id,
+                            "status": "provider_missing",
+                            "reason": "provider_not_configured",
+                            "segments_total": 0,
+                            "segments_translated": 0,
+                            "segments_skipped": 0,
+                            "segments_unchanged": 0,
+                            "segments_failed": 0,
+                            "reasons": ["provider_not_configured"],
+                        }
+                    )
                 continue
             key = (
                 provider_id,
@@ -70,23 +135,57 @@ class RSSRuntime:
                 article.article_id,
                 f"{article.content_hash}:{article.title}",
                 translation_prompt,
+                self.config.translation_timeout_seconds,
+                self.config.translation_total_timeout_seconds,
+                self.config.translation_max_segment_chars,
+                self.config.translation_max_requests,
             )
             cached = self._translation_cache.get(key)
             if cached is not None:
-                rendered_articles.append(replace(article, title=cached.title, content_blocks=cached.content_blocks))
-                continue
-            try:
-                outcome = await translator.translate_article(
-                    article, include_original=self.config.translation_include_original
+                self._translation_cache.move_to_end(key)
+                outcome = cached
+            else:
+                task = self._translation_tasks.get(key)
+                if task is None:
+                    task = asyncio.create_task(
+                        translator.translate_article(article, include_original=self.config.translation_include_original)
+                    )
+                    self._translation_tasks[key] = task
+
+                    def forget_translation(completed, *, translation_key=key):
+                        if self._translation_tasks.get(translation_key) is completed:
+                            self._translation_tasks.pop(translation_key, None)
+                        if not completed.cancelled():
+                            completed.exception()
+
+                    task.add_done_callback(forget_translation)
+                try:
+                    outcome = await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    from ..services.translation import TranslationOutcome
+
+                    logger.warning("AI 翻译任务失败，保留原文（%s）", type(exc).__name__)
+                    outcome = TranslationOutcome(article, False, "failed", "translation_task_failed")
+                if outcome.succeeded and outcome.status in {"translated", "skipped"}:
+                    self._translation_cache[key] = outcome
+                    self._translation_cache.move_to_end(key)
+                    while len(self._translation_cache) > 256:
+                        self._translation_cache.popitem(last=False)
+            rendered_articles.append(
+                outcome.article
+                if outcome.article is article
+                else replace(article, title=outcome.article.title, content_blocks=outcome.article.content_blocks)
+            )
+            if diagnostics is not None:
+                diagnostics.append(
+                    {
+                        "article_id": article.article_id,
+                        "feed_id": article.feed_id,
+                        **outcome.diagnostic(),
+                    }
                 )
-            except Exception:
-                rendered_articles.append(article)
-                continue
-            rendered_articles.append(outcome.article)
-            if outcome.succeeded and outcome.article is not article:
-                if len(self._translation_cache) >= 256:
-                    self._translation_cache.clear()
-                self._translation_cache[key] = outcome.article
         return rendered_articles
 
     def feed_refresh_lock(self, feed_id: str) -> asyncio.Lock:
@@ -220,11 +319,12 @@ class RSSRuntime:
 
     async def _maintenance_loop(self) -> None:
         while not self._stop.is_set():
+            stage = "run_maintenance_once"
             try:
                 await self.run_maintenance_once()
-            except Exception:
+            except Exception as exc:
                 # A maintenance failure must not terminate scheduling or delivery.
-                pass
+                logger.warning("RSS maintenance failed during %s (%s)", stage, type(exc).__name__)
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=self.config.cookie_cleanup_interval)
             except TimeoutError:
@@ -247,6 +347,19 @@ class RSSRuntime:
                 await asyncio.gather(*tasks, return_exceptions=True)
             except asyncio.CancelledError as exc:
                 cancelled_error = exc
+            except Exception as exc:
+                cleanup_errors.append(exc)
+        translation_tasks = list(set(self._translation_tasks.values()))
+        self._translation_tasks.clear()
+        self._translation_cache.clear()
+        for task in translation_tasks:
+            task.cancel()
+        if translation_tasks:
+            try:
+                await asyncio.gather(*translation_tasks, return_exceptions=True)
+            except asyncio.CancelledError as exc:
+                if cancelled_error is None:
+                    cancelled_error = exc
             except Exception as exc:
                 cleanup_errors.append(exc)
         try:
@@ -353,7 +466,9 @@ class RSSRuntime:
             articles = [article for article in articles if article is not None]
             feed = await self.repository.get_feed(operation["feed_id"])
             try:
-                articles = await self._articles_for_render(articles)
+                translation_diagnostics = []
+                articles = await self._articles_for_render(articles, diagnostics=translation_diagnostics)
+                await self.repository.set_test_operation_translation_diagnostics(operation_id, translation_diagnostics)
                 rendered = await self.registry.render(
                     articles, target, source_name=feed.title or feed.url, is_list=False, batch_id=group_id
                 )
@@ -574,6 +689,27 @@ class RSSRuntime:
 
         await DeliveryQueue(self).run(self._stop)
 
+    async def _mark_card_unknown_after_send(self, card, error: Exception) -> None:
+        """Persist an ambiguous post-send outcome without risking an automatic duplicate."""
+        message = str(error)[:500]
+        try:
+            await self.repository.set_batch_card_status(card["batch_id"], "unknown", error=message)
+        except Exception as persist_error:
+            logger.error("Could not persist unknown delivery card (%s)", type(persist_error).__name__)
+        for delivery_id in card["delivery_ids"]:
+            try:
+                await self.repository.mark_delivery(delivery_id, "unknown", error=message)
+            except Exception as persist_error:
+                logger.error("Could not persist unknown delivery (%s)", type(persist_error).__name__)
+
+    async def _release_unattempted_claims(self, claim_ids, *, protected_ids=()) -> None:
+        # Pending deliveries can be the result of one successful card plus another
+        # card that was never attempted. Roll back their claim so max_retries=0
+        # cannot strand the outstanding card.
+        releasable = list(set(claim_ids) - set(protected_ids))
+        if releasable:
+            await self.repository.release_unattempted_deliveries(releasable)
+
     async def _deliver_group(self, candidates, semaphore):
         if len(candidates) > 1:
             partitions = {}
@@ -592,10 +728,15 @@ class RSSRuntime:
                 )
                 partitions.setdefault(key, []).append(candidate)
             if len(partitions) > 1:
-                await asyncio.gather(
+                outcomes = await asyncio.gather(
                     *(self._deliver_group(rows, semaphore) for rows in partitions.values()),
                     return_exceptions=True,
                 )
+                for outcome in outcomes:
+                    if isinstance(outcome, asyncio.CancelledError):
+                        raise outcome
+                    if isinstance(outcome, BaseException):
+                        logger.error("RSS delivery partition failed (%s)", type(outcome).__name__)
                 return
         async with semaphore:
             valid = []
@@ -617,6 +758,11 @@ class RSSRuntime:
             )
             if not rows:
                 return
+            claim_ids = {row["delivery_id"] for row in rows}
+            active_card = None
+            send_started = False
+            active_card_success_persisted = False
+            max_attempts = 1 + self.config.max_delivery_retries
             try:
                 # A retry after a partial batch reuses the persisted group, payloads and UUIDs.
                 group_id = await self.repository.batch_group([r["delivery_id"] for r in rows])
@@ -646,10 +792,17 @@ class RSSRuntime:
                         if article is not None:
                             articles.append(article)
                     if not articles:
+                        await self._release_unattempted_claims(claim_ids)
                         return
+                    ids_by_article = {row["article_id"]: row["delivery_id"] for row in rows}
                     source_path = rows[0]["source_path"]
                     info = source_info.get(rows[0]["delivery_id"], {})
-                    articles = await self._articles_for_render(articles)
+                    translation_diagnostics = []
+                    articles = await self._articles_for_render(articles, diagnostics=translation_diagnostics)
+                    for diagnostic in translation_diagnostics:
+                        delivery_id = ids_by_article.get(diagnostic.get("article_id"))
+                        if delivery_id:
+                            await self.repository.set_delivery_translation_diagnostics(delivery_id, diagnostic)
                     rendered = await self.registry.render(
                         articles,
                         target,
@@ -667,7 +820,6 @@ class RSSRuntime:
                         is_list=bool(info.get("is_list", source_path.startswith("list:"))),
                         batch_id=group_id,
                     )
-                    ids_by_article = {row["article_id"]: row["delivery_id"] for row in rows}
                     persisted_cards = []
                     for index, message in enumerate(rendered):
                         card_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"{group_id}:{index}"))
@@ -695,8 +847,52 @@ class RSSRuntime:
                     cards = await self.repository.batch_cards(group_id)
                 for card in cards:
                     if card["status"] == "success":
+                        active_card = card
+                        active_card_success_persisted = True
+                        for did in card["delivery_ids"]:
+                            await self.repository.refresh_delivery_from_batches(did)
                         continue
                     if card["status"] == "unknown":
+                        continue
+                    active_card = card
+                    active_card_success_persisted = False
+                    links = card["delivery_ids"]
+                    linked_rows = []
+                    for delivery_id in links:
+                        linked = await self.repository.delivery(delivery_id)
+                        if linked is not None:
+                            linked_rows.append(linked)
+                    unknown_links = [row for row in linked_rows if row["status"] == "unknown"]
+                    permanent_links = [row for row in linked_rows if row["status"] == "failed" and not row["retryable"]]
+                    if unknown_links:
+                        await self.repository.set_batch_card_status(
+                            card["batch_id"],
+                            "failed",
+                            error="card is blocked by an article with unknown delivery status",
+                        )
+                        # This card was never sent. Keep the unknown state scoped to the
+                        # actual send attempt so resolving it cannot mark this card successful.
+                        blocked_ids = {row["delivery_id"] for row in unknown_links}
+                        for linked in linked_rows:
+                            if linked["delivery_id"] not in blocked_ids:
+                                await self.repository.make_delivery_permanent(
+                                    linked["delivery_id"], "card blocked by an article with unknown delivery status"
+                                )
+                        continue
+                    if permanent_links:
+                        await self.repository.set_batch_card_status(
+                            card["batch_id"], "failed", error="card contains a permanently failed article"
+                        )
+                        blocked_ids = {row["delivery_id"] for row in permanent_links}
+                        for linked in linked_rows:
+                            if linked["delivery_id"] not in blocked_ids:
+                                await self.repository.make_delivery_permanent(
+                                    linked["delivery_id"], "card blocked by a permanently failed article"
+                                )
+                        continue
+                    # A persisted group can be reached through a different eligible row. Do not
+                    # bypass another article's backoff or retry limit by replaying its card.
+                    if links and not all(delivery_id in claim_ids for delivery_id in links):
                         continue
                     data = card["payload"]
                     from ..core.models import RenderedMessage
@@ -712,6 +908,7 @@ class RSSRuntime:
                     for did in card["delivery_ids"]:
                         await self.repository.mark_delivery(did, "sending")
                     await self.repository.set_batch_card_status(card["batch_id"], "sending")
+                    send_started = True
                     try:
                         result = await self.sender.send(target, message, idempotency_key=card["idempotency_key"])
                     except Exception as exc:
@@ -743,34 +940,75 @@ class RSSRuntime:
                             )
                             for did in card["delivery_ids"]:
                                 await self.repository.mark_delivery(did, "unknown", error=str(exc)[:500])
+                        send_started = False
+                        await self._release_unattempted_claims(claim_ids)
                         return
-                    await self.repository.set_batch_card_status(
-                        card["batch_id"], "success", platform_message_id=result.platform_message_id
-                    )
+                    try:
+                        await self.repository.set_batch_card_status(
+                            card["batch_id"], "success", platform_message_id=result.platform_message_id
+                        )
+                    except Exception as exc:
+                        await self._mark_card_unknown_after_send(card, exc)
+                        await self._release_unattempted_claims(claim_ids, protected_ids=links)
+                        return
+                    active_card_success_persisted = True
+                    send_started = False
                     for did in card["delivery_ids"]:
                         await self.repository.refresh_delivery_from_batches(did)
+                await self._release_unattempted_claims(claim_ids)
             except Exception as exc:
+                if send_started and active_card is not None:
+                    # send() was invoked, so a failed write may have lost the real platform outcome.
+                    await self._mark_card_unknown_after_send(active_card, exc)
+                    await self._release_unattempted_claims(claim_ids, protected_ids=active_card["delivery_ids"])
+                    return
+                if active_card is not None:
+                    if active_card_success_persisted:
+                        # The platform receipt and successful card state are durable. A refresh
+                        # hiccup must never turn that known success into an automatic resend.
+                        for did in active_card["delivery_ids"]:
+                            try:
+                                await self.repository.refresh_delivery_from_batches(did)
+                            except Exception as refresh_error:
+                                logger.error("Could not refresh completed delivery (%s)", type(refresh_error).__name__)
+                    else:
+                        try:
+                            await self.repository.set_batch_card_status(
+                                active_card["batch_id"], "failed", error=str(exc)[:500]
+                            )
+                        except Exception as persist_error:
+                            logger.error("Could not persist failed unsent card (%s)", type(persist_error).__name__)
+                        from .errors import PermanentSendError, RenderingError
+
+                        retry_at = now_ts() + self.config.retry_backoff_base
+                        for delivery_id in active_card["delivery_ids"]:
+                            if isinstance(exc, (PermanentSendError, RenderingError)):
+                                await self.repository.make_delivery_permanent(delivery_id, str(exc))
+                            else:
+                                await self.repository.fail_claimed_delivery(
+                                    delivery_id,
+                                    str(exc),
+                                    max_attempts=max_attempts,
+                                    retry_at=retry_at,
+                                )
+                    await self._release_unattempted_claims(claim_ids)
+                    return
+                retry_at = now_ts() + self.config.retry_backoff_base
                 from .errors import PermanentSendError, RenderingError
 
-                for row in rows:
+                for delivery_id in claim_ids:
                     if isinstance(exc, (PermanentSendError, RenderingError)):
-                        await self.repository.make_delivery_permanent(row["delivery_id"], str(exc))
+                        await self.repository.make_delivery_permanent(delivery_id, str(exc))
                     else:
-                        await self.repository.mark_delivery(
-                            row["delivery_id"],
-                            "failed",
-                            error=str(exc)[:500],
-                            retry_at=now_ts() + self.config.retry_backoff_base,
+                        await self.repository.fail_claimed_delivery(
+                            delivery_id,
+                            str(exc),
+                            max_attempts=max_attempts,
+                            retry_at=retry_at,
                         )
 
     async def list_feed_articles(self, feed_id: str, limit: int = 100):
-        rows = await self.database.fetchall(
-            "SELECT article_id FROM articles WHERE feed_id=? "
-            "ORDER BY COALESCE(published_at,updated_at,first_seen_at) DESC,seq DESC,article_id DESC LIMIT ?",
-            (feed_id, min(max(limit, 1), 500)),
-        )
-        articles = await asyncio.gather(*(self.repository.article(r[0]) for r in rows))
-        return [article for article in articles if article is not None]
+        return await self.repository.articles_for_feed(feed_id, min(max(limit, 1), 500))
 
     async def backup(self, destination):
         dest = Path(destination)
@@ -834,6 +1072,17 @@ class RSSRuntime:
                     (cutoff,),
                 )
                 articles = cur.rowcount
+            cur = await conn.execute(
+                "DELETE FROM telegraph_pages WHERE NOT EXISTS "
+                "(SELECT 1 FROM articles WHERE articles.article_id=telegraph_pages.article_id)"
+            )
+            telegraph_pages = cur.rowcount
             cur = await conn.execute("DELETE FROM fetch_logs WHERE fetched_at<?", (cutoff,))
             fetch_logs = cur.rowcount
-        return {"kind": kind, "articles": articles, **history, "fetch_logs": fetch_logs}
+        return {
+            "kind": kind,
+            "articles": articles,
+            **history,
+            "fetch_logs": fetch_logs,
+            "telegraph_pages": telegraph_pages,
+        }

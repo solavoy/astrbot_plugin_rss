@@ -529,6 +529,12 @@ textarea {
   width:100%;
   overflow:auto
 }
+.translation-summary {
+  display:block;
+  margin-top:4px;
+  color:var(--muted);
+  font-size:11px
+}
 table {
   width:100%;
   border-collapse:collapse;

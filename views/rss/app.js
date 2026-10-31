@@ -343,6 +343,61 @@ function App() {
                 return '直接订阅';
             return value || '—';
         },
+        translationStatusLabel(diagnostic) {
+            if (!diagnostic || !diagnostic.status)
+                return '未记录';
+            return ({
+                disabled: '未启用',
+                provider_missing: '缺少翻译模型',
+                skipped: '未翻译',
+                translated: '已翻译',
+                partial: '部分翻译',
+                failed: '翻译失败',
+            })[diagnostic.status] || '未知状态';
+        },
+        translationReasonLabel(diagnostic) {
+            const code = diagnostic?.reason || diagnostic?.reasons?.[0];
+            if (!code)
+                return '';
+            return ({
+                feed_translation_disabled: '订阅源未启用翻译',
+                feed_unavailable: '订阅源不可用',
+                provider_not_configured: '未配置翻译模型',
+                provider_unavailable: '翻译服务不可用',
+                timeout: '分段请求超时',
+                total_timeout: '达到整篇翻译时限',
+                request_limit: '达到分段请求数上限',
+                segment_too_large: '单段超过请求上限',
+                provider_error: '模型请求失败',
+                empty_response: '模型返回空结果',
+                invalid_response: '模型响应格式无效',
+                unchanged_response: '模型原样返回部分文本',
+                model_skipped: '模型标记无需翻译',
+                no_translatable_text: '没有可翻译文本',
+                article_cleanup_failed: '文章预处理失败',
+                markdown_parse_failed: 'Markdown 解析失败',
+                markdown_restore_failed: 'Markdown 重组失败',
+                translation_task_failed: '翻译任务失败',
+                translation_failed: '翻译失败',
+            })[code] || '翻译未完成';
+        },
+        translationReasons(diagnostic) {
+            const codes = [...new Set([diagnostic?.reason, ...(diagnostic?.reasons || [])].filter(Boolean))];
+            return codes.map(code => this.translationReasonLabel({ reason: code })).join('；');
+        },
+        translationSummary(record) {
+            const diagnostic = Array.isArray(record?.translation_diagnostics) ? record.translation_diagnostics[0] : null;
+            if (!diagnostic)
+                return '未记录';
+            const label = this.translationStatusLabel(diagnostic);
+            const reason = this.translationReasonLabel(diagnostic);
+            return reason ? `${label} · ${reason}` : label;
+        },
+        translationCounts(diagnostic) {
+            if (!diagnostic || !Number.isInteger(diagnostic.segments_total))
+                return '未记录';
+            return `含译文 ${diagnostic.segments_translated||0} 段 · 明确跳过 ${diagnostic.segments_skipped||0} · 原样返回 ${diagnostic.segments_unchanged||0} · 含失败 ${diagnostic.segments_failed||0} 段（总 ${diagnostic.segments_total} 段；分段可有重叠）`;
+        },
         async scheduler(action) { await this.perform(async () => { await this.post('scheduler', { action }); this.notice = action === 'pause' ? '调度已暂停' : action === 'resume' ? '调度已恢复' : '已请求立即检查'; await this.load(); }); },
         async perform(fn) {
             if (this.busy)
@@ -409,25 +464,37 @@ function App() {
             await this.perform(async () => { await this.post('deliveries/' + encodeURIComponent(id) + '/resolve', { confirm: true, resolution }); this.notice = resolution === 'delivered' ? '已记录人工确认。' : '已安排人工确认后的重试。'; await this.load(); });
         },
         async feedAction(action) {
+            this.notice = '';
             if (action === 'test' && !this.targetId) {
                 this.error = '请选择测试推送目标';
                 return;
             }
             await this.perform(async () => {
+                let actionError = '';
                 let body = action === 'test' ? { target_id: this.targetId } : action === 'preview' && this.targetId ? { target_id: this.targetId } : {};
                 let r = await this.post(this.detailEndpoint('feeds', `/${action}`), body);
                 if (action === 'refresh') {
                     if (r.status === 'skipped' && r.reason === 'concurrent_refresh')
                         this.notice = '订阅源刚刚已完成检查，本次刷新已合并，请查看最新抓取日志';
+                    else if (r.status === 'error')
+                        actionError = r.error || '订阅源检查失败';
                     else
                         this.notice = r.status === 'not_modified' ? '检查完成，内容没有变化' : `检查完成，新增 ${r.new_articles || 0} 篇文章`;
                 }
-                else if (action === 'test')
-                    this.notice = `测试推送状态：${r.status || '未知'}${r.operation_id ? '（操作 ID：' + r.operation_id + '）' : ''}`;
+                else if (action === 'test') {
+                    const detail = this.translationSummary(r);
+                    const suffix = r.operation_id ? `（操作 ID：${r.operation_id}）` : '';
+                    if (r.status === 'failed')
+                        actionError = `测试推送失败：${r.error || '发送失败'} · 翻译：${detail}${suffix}`;
+                    else
+                        this.notice = `测试推送状态：${r.status || '未知'} · 翻译：${detail}${suffix}`;
+                }
                 else
                     this.preview = r;
                 this.setTimezone(r);
                 await this.load();
+                if (actionError)
+                    this.error = actionError;
             });
         },
         async saveFeed() {

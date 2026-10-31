@@ -1,12 +1,52 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from datetime import datetime
 from datetime import time as datetime_time
 from zoneinfo import ZoneInfo
 
 from .interval_inputs import attach_interval_inputs
+
+_TRANSLATION_STATUSES = {"disabled", "provider_missing", "skipped", "translated", "partial", "failed"}
+_SAFE_REASON = re.compile(r"^[a-z0-9_]{1,64}$")
+
+
+def _decode_translation_diagnostics(value):
+    try:
+        diagnostics = json.loads(value or "[]")
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(diagnostics, list):
+        return []
+    result = []
+    for item in diagnostics[:100]:
+        if not isinstance(item, dict) or item.get("status") not in _TRANSLATION_STATUSES:
+            continue
+        reason = item.get("reason")
+        if reason is not None and (not isinstance(reason, str) or not _SAFE_REASON.fullmatch(reason)):
+            reason = None
+        reasons = item.get("reasons")
+        if not isinstance(reasons, list):
+            reasons = []
+        clean_reasons = [
+            reason_code
+            for reason_code in reasons[:20]
+            if isinstance(reason_code, str) and _SAFE_REASON.fullmatch(reason_code)
+        ]
+        clean = {"status": item["status"], "reason": reason, "reasons": clean_reasons}
+        for key in (
+            "segments_total",
+            "segments_translated",
+            "segments_skipped",
+            "segments_unchanged",
+            "segments_failed",
+        ):
+            count = item.get(key)
+            clean[key] = count if type(count) is int and 0 <= count <= 1_000_000 else 0
+        result.append(clean)
+    return result
 
 
 def _local_day_start(timestamp: float, timezone: str) -> float:
@@ -160,6 +200,24 @@ class ManagementRepository:
             "fetch_logs": [dict(r) for r in logs],
         }
 
+    async def recent_test_operations(self, feed_id: str, limit: int = 20):
+        rows = await self.db.fetchall(
+            "SELECT o.operation_id,o.target_id,o.feed_id,o.article_ids,o.status,o.error,o.translation_diagnostics,"
+            "o.created_at,o.updated_at,t.label target_label FROM test_operations o "
+            "JOIN targets t USING(target_id) WHERE o.feed_id=? ORDER BY o.created_at DESC,o.rowid DESC LIMIT ?",
+            (feed_id, limit),
+        )
+        result = []
+        for row in rows:
+            item = dict(row)
+            try:
+                item["article_ids"] = json.loads(item["article_ids"])
+            except (TypeError, ValueError):
+                item["article_ids"] = []
+            item["translation_diagnostics"] = _decode_translation_diagnostics(item.get("translation_diagnostics"))
+            result.append(item)
+        return result
+
     async def list_detail(self, list_id: str):
         row = await self.db.fetchone("SELECT * FROM subscription_lists WHERE list_id=?", (list_id,))
         if not row:
@@ -222,6 +280,10 @@ class ManagementRepository:
         )
         if not delivery:
             return None
+        delivery_data = dict(delivery)
+        delivery_data["translation_diagnostics"] = _decode_translation_diagnostics(
+            delivery_data.get("translation_diagnostics")
+        )
         attempts = await self.db.fetchall(
             "SELECT * FROM delivery_attempts WHERE delivery_id=? ORDER BY attempted_at DESC,attempt_id DESC",
             (delivery_id,),
@@ -245,7 +307,7 @@ class ManagementRepository:
             item["article_ids"] = [row["article_id"] for row in links]
             batch_data.append(item)
         return {
-            "delivery": dict(delivery),
+            "delivery": delivery_data,
             "article": {
                 k: delivery[k]
                 for k in ("article_id", "feed_id", "feed_public_id", "title", "canonical_url", "content_blocks")

@@ -85,6 +85,56 @@ def test_interval_display_falls_back_and_invalid_metadata_write_rolls_back(tmp_p
     asyncio.run(run())
 
 
+def test_list_preview_loads_articles_with_one_repository_query(tmp_path, monkeypatch):
+    from astrbot_plugin_rss.core.models import Article
+
+    class PreviewRegistry:
+        def __init__(self):
+            self.titles = []
+
+        async def render(self, articles, target, source_name, is_list=False):
+            assert is_list is True
+            self.titles = [article.title for article in articles]
+            return []
+
+    async def run():
+        runtime = RSSRuntime({}, tmp_path / "data")
+        await runtime.initialize()
+        service = ManagementService(runtime)
+        try:
+            list_id = await runtime.repository.create_list("Preview")
+            for index in range(2):
+                feed = await runtime.repository.create_feed(f"https://example.org/preview-{index}")
+                await runtime.repository.add_list_feed(list_id, feed.feed_id)
+                await runtime.repository.save_articles(
+                    feed.feed_id,
+                    [
+                        Article(
+                            "",
+                            feed.feed_id,
+                            f"entry-{index}",
+                            f"https://example.org/article-{index}",
+                            f"Article {index}",
+                            published_at=float(index),
+                        )
+                    ],
+                )
+            registry = PreviewRegistry()
+            runtime.registry = registry
+
+            async def unexpected_article_lookup(article_id):
+                raise AssertionError("list preview must not load articles one by one")
+
+            monkeypatch.setattr(runtime.repository, "article", unexpected_article_lookup)
+            preview = await service._preview_list(list_id, None)
+            assert preview["article_count"] == 2
+            assert registry.titles == ["Article 1", "Article 0"]
+        finally:
+            await runtime.close()
+
+    asyncio.run(run())
+
+
 def test_business_import_export_roundtrip_and_relationship_validation(tmp_path, monkeypatch):
     from types import SimpleNamespace
 

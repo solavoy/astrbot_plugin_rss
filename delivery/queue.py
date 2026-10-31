@@ -25,10 +25,15 @@ class DeliveryQueue:
             )
             grouped.setdefault(key, []).append(row)
         semaphore = asyncio.Semaphore(runtime.config.delivery_concurrency)
-        await asyncio.gather(
+        outcomes = await asyncio.gather(
             *(runtime._deliver_group(rows, semaphore) for rows in grouped.values()),
             return_exceptions=True,
         )
+        for outcome in outcomes:
+            if isinstance(outcome, asyncio.CancelledError):
+                raise outcome
+            if isinstance(outcome, BaseException):
+                logger.error("RSS delivery group failed (%s)", type(outcome).__name__)
         return len(items)
 
     async def run(self, stop_event: asyncio.Event) -> None:

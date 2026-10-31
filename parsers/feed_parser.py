@@ -241,12 +241,12 @@ class FeedParser:
                     title=title,
                     author=author,
                     published_at=_date(
-                        entry.get("published_parsed")
-                        or entry.get("published")
-                        or entry.get("updated_parsed")
-                        or entry.get("updated")
+                        dict.get(entry, "published_parsed")
+                        or dict.get(entry, "published")
+                        or dict.get(entry, "updated_parsed")
+                        or dict.get(entry, "updated")
                     ),
-                    updated_at=_date(entry.get("updated_parsed") or entry.get("updated")),
+                    updated_at=_date(dict.get(entry, "updated_parsed") or dict.get(entry, "updated")),
                     categories=categories,
                     content_blocks=[ContentBlock("markdown", text=markdown)],
                     metadata=metadata,

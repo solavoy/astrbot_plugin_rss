@@ -520,6 +520,7 @@
                     <button class="detail-tab" :class="{active:detailTab==='subscribers'}" role="tab" :aria-selected="detailTab==='subscribers'" @click="detailTab='subscribers'">订阅渠道</button>
                     <button class="detail-tab" :class="{active:detailTab==='articles'}" role="tab" :aria-selected="detailTab==='articles'" @click="detailTab='articles'">最新文章</button>
                     <button class="detail-tab" :class="{active:detailTab==='fetch_logs'}" role="tab" :aria-selected="detailTab==='fetch_logs'" @click="detailTab='fetch_logs'">抓取日志</button>
+                    <button class="detail-tab" :class="{active:detailTab==='test_history'}" role="tab" :aria-selected="detailTab==='test_history'" @click="detailTab='test_history'">测试记录</button>
                   </div>
                   <div v-if="detailTab==='subscribers'">
                     <h2>订阅渠道 · {{feedSubscribers().length}}</h2>
@@ -551,6 +552,16 @@
                       <span>{{log.error_type||'成功'}}</span>
                       <span>{{date(log.fetched_at)}}</span>
                       <small>{{log.error_message||log.status_code||''}}</small>
+                    </div>
+                  </div>
+                  <div v-if="detailTab==='test_history'">
+                    <h2>测试推送记录 · {{detail?.test_operations?.length||0}}</h2>
+                    <div v-if="!detail?.test_operations?.length" class="empty-state compact">暂无测试推送记录</div>
+                    <div v-for="operation in (detail?.test_operations||[])" class="timeline-item">
+                      <strong>{{operation.status}} · {{operation.target_label||operation.target_id}}</strong>
+                      <small>{{date(operation.updated_at)}} · {{translationSummary(operation)}}</small>
+                      <small v-if="operation.error">{{operation.error}}</small>
+                      <small v-for="diagnostic in (operation.translation_diagnostics||[])">{{translationCounts(diagnostic)}}</small>
                     </div>
                   </div>
                 </section>
@@ -1022,6 +1033,7 @@
                         </td>
                         <td>
                           {{d.status}}
+                          <small class="translation-summary">翻译：{{translationSummary(d)}}</small>
                         </td>
                         <td>
                           {{date(d.created_at)}}
@@ -1140,6 +1152,14 @@
                       <small>
                         {{a.platform_message_id||a.error||''}}
                       </small>
+                    </div>
+                  </section>
+                  <section class="panel">
+                    <h2>翻译诊断</h2>
+                    <div v-if="!detail?.delivery?.translation_diagnostics?.length" class="empty-state compact">未记录</div>
+                    <div v-for="diagnostic in (detail?.delivery?.translation_diagnostics||[])" class="timeline-item">
+                      <strong>{{translationStatusLabel(diagnostic)}}{{translationReasonLabel(diagnostic)?' · '+translationReasonLabel(diagnostic):''}}</strong>
+                      <small>{{translationCounts(diagnostic)}}</small>
                     </div>
                   </section>
                 </div>

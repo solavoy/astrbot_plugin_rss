@@ -1,6 +1,6 @@
 # SQLite 与一致性设计
 
-数据库置于 `StarTools.get_data_dir("astrbot_plugin_rss")/rss.sqlite3`。启用 WAL、foreign_keys、busy_timeout，执行 user_version 迁移。Schema v3 为 `feeds` 增加 `translation_enabled`，默认关闭；从 v1/v2 升级的 Feed 均以关闭状态迁移。所有写入参数化；关键多步操作在锁保护的事务完成。
+数据库置于 `StarTools.get_data_dir("astrbot_plugin_rss")/rss.sqlite3`。启用 WAL、foreign_keys、busy_timeout，执行 user_version 迁移。Schema v3 为 `feeds` 增加 `translation_enabled`，默认关闭；从 v1/v2 升级的 Feed 均以关闭状态迁移。`deliveries` 与 `test_operations` 另以可加列迁移方式保存不含文章正文、提示词或凭据的翻译诊断 JSON；旧 v3 数据库初始化时补空默认值，旧 v3 备份仍可恢复。所有写入参数化；关键多步操作在锁保护的事务完成。
 
 | 表                             | 作用与约束                                                                                          |
 | ----------------------------- | ---------------------------------------------------------------------------------------------- |
@@ -12,11 +12,11 @@
 | list_feeds                    | list+feed 唯一；成员加入时记录基线，移除不删除 Feed                                                              |
 | list_subscriptions            | target+list 唯一、独立路径游标与周期                                                                       |
 | 路径游标                          | 合并在直接订阅、列表订阅和列表成员关系中，保存 baseline_seq、last_seq、next_check_at                                    |
-| deliveries                    | target+article 唯一，pending/rendering/sending/success/failed/unknown，重试时间与归属路径                   |
+| deliveries                    | target+article 唯一，pending/rendering/sending/success/failed/unknown，重试时间、归属路径与翻译诊断         |
 | delivery_attempts             | 每次尝试结果、错误、平台消息 ID                                                                              |
 | delivery_batches              | batch、稳定 UUID、卡片索引/总数、payload、发送结果                                                             |
 | batch_articles                | batch 与 article/delivery 的唯一关联                                                                 |
-| test_operations               | 人工测试推送独立操作，复用持久化卡片状态，独立于正常目标/文章去重                                                              |
+| test_operations               | 人工测试推送独立操作，复用持久化卡片状态并保存翻译诊断，独立于正常目标/文章去重                              |
 | fetch_logs                    | curl/browser/304/错误和耗时，不含 Cookie                                                               |
 | 站点会话文件                        | 受保护的独立 Cookie JSON 与浏览器 profile，位于抓取持久化目录；数据库导出不包含这些文件                                         |
 | 媒体缓存文件 / platform_media_cache | 本地媒体与元数据文件；数据库保存应用实例维度上传 key 和有效期                                                              |

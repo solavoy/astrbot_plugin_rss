@@ -52,10 +52,12 @@ class FeedScheduler:
                         feed_id, runtime.config.global_poll_interval, runtime.config.min_poll_interval
                     )
                     current_row = {**row, "required_interval": interval}
+                    stage = "fetch"
                     try:
                         result = await runtime.fetcher.fetch(feed, force=force)
                         if result.error_type:
                             results["errors"] += 1
+                            stage = "record_fetch_error"
                             await runtime.repository.log_fetch(
                                 feed.feed_id,
                                 result.fetched_at,
@@ -67,6 +69,7 @@ class FeedScheduler:
                                 result.cookie_cache_hit,
                                 result.browser_attempted,
                             )
+                            stage = "update_fetch_state"
                             await runtime.repository.update_fetch_state(
                                 feed.feed_id,
                                 etag=feed.etag,
@@ -76,6 +79,7 @@ class FeedScheduler:
                                 status=result.error_type,
                             )
                             return
+                        stage = "persist_fetch"
                         fetched = await runtime._persist_fetch(feed, result, interval)
                         if fetched.get("status") == "error":
                             results["errors"] += 1
@@ -84,6 +88,7 @@ class FeedScheduler:
                             results["new_articles"] += fetched.get("new_articles", 0)
                     except Exception as exc:
                         results["errors"] += 1
+                        logger.warning("RSS feed processing failed during %s (%s)", stage, type(exc).__name__)
                         await runtime.repository.update_fetch_state(
                             feed.feed_id,
                             etag=feed.etag,

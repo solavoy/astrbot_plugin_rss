@@ -4,6 +4,7 @@ import asyncio
 import logging
 import re
 import uuid
+from collections import deque
 from dataclasses import dataclass, replace
 from types import SimpleNamespace
 from typing import Any
@@ -16,6 +17,8 @@ _URL_TEXT = re.compile(r"(?i)(?:https?://|www\.)[^\s<>\"']+")
 _RSS_MARKER = re.compile(r"\[\[RSS_[^\]\r\n]*\]\]")
 _RSS_MARKER_PREFIX = re.compile(r"\[\[RSS_")
 _LOGGER = logging.getLogger(__name__)
+_UNCHANGED = object()
+_FAILED = object()
 
 
 @dataclass(slots=True)
@@ -47,9 +50,39 @@ class _InlinePatch:
 
 
 @dataclass(slots=True)
+class _RequestPart:
+    unit: _TextUnit
+    parent: _TextUnit
+    prefix: str = ""
+    separator_before: str = ""
+    suffix: str = ""
+
+
+@dataclass(slots=True)
 class TranslationOutcome:
     article: Article
     succeeded: bool
+    status: str = "failed"
+    reason: str | None = None
+    segments_total: int = 0
+    segments_translated: int = 0
+    segments_skipped: int = 0
+    segments_unchanged: int = 0
+    segments_failed: int = 0
+    reasons: list[str] | None = None
+
+    def diagnostic(self) -> dict[str, Any]:
+        """Return content-free translation metadata suitable for persistent history."""
+        return {
+            "status": self.status,
+            "reason": self.reason,
+            "segments_total": self.segments_total,
+            "segments_translated": self.segments_translated,
+            "segments_skipped": self.segments_skipped,
+            "segments_unchanged": self.segments_unchanged,
+            "segments_failed": self.segments_failed,
+            "reasons": list(self.reasons or ([self.reason] if self.reason else [])),
+        }
 
 
 class TranslationService:
@@ -62,24 +95,30 @@ class TranslationService:
         *,
         prompt: str = DEFAULT_TRANSLATION_PROMPT,
         timeout_seconds: float = 30.0,
+        total_timeout_seconds: float = 90.0,
+        max_segment_chars: int = 12_000,
+        max_requests: int = 12,
     ) -> None:
         self.context = context
         self.provider_id = provider_id
         self.prompt = normalize_translation_prompt(prompt)
         self.timeout_seconds = timeout_seconds
+        self.total_timeout_seconds = total_timeout_seconds
+        self.max_segment_chars = max_segment_chars
+        self.max_requests = max_requests
 
     async def translate_article(self, article: Article, *, include_original: bool = True) -> TranslationOutcome:
         if not self.provider_id:
-            return TranslationOutcome(article, False)
+            return TranslationOutcome(article, False, "provider_missing", "provider_not_configured")
         if self.context is None:
             _LOGGER.warning("AI 翻译上下文不可用，已回退原文")
-            return TranslationOutcome(article, False)
+            return TranslationOutcome(article, False, "failed", "provider_unavailable")
         try:
             normalized = clean_cached_article(article)
             body = article_markdown(normalized)
         except Exception as exc:
             _LOGGER.warning("AI 翻译前文章清理失败，已回退原文（%s）", type(exc).__name__)
-            return TranslationOutcome(article, False)
+            return TranslationOutcome(article, False, "failed", "article_cleanup_failed")
 
         nonce = uuid.uuid4().hex
         units: list[_TextUnit] = []
@@ -98,44 +137,188 @@ class TranslationService:
             patches, body_units = self._collect_body_units(body, nonce, len(units))
         except Exception as exc:
             _LOGGER.warning("AI 翻译 Markdown 定位失败，已回退原文（%s）", type(exc).__name__)
-            return TranslationOutcome(article, False)
+            return TranslationOutcome(article, False, "failed", "markdown_parse_failed")
         units.extend(body_units)
         if not units:
-            return TranslationOutcome(normalized, True)
+            return TranslationOutcome(normalized, True, "skipped", "no_translatable_text")
 
-        prompt = self._input_prompt(units, nonce)
         system_prompt = self._system_prompt(self.prompt)
-        try:
-            response = await asyncio.wait_for(
-                self.context.llm_generate(
-                    chat_provider_id=self.provider_id,
-                    prompt=prompt,
-                    system_prompt=system_prompt,
-                ),
-                timeout=self.timeout_seconds,
-            )
+        request_parts, oversized_parents = self._request_parts(units, nonce, self.max_segment_chars)
+        request_units = [part.unit for part in request_parts]
+        chunks, oversized_requests = self._chunk_units(request_units, nonce, self.max_segment_chars)
+        parts_by_unit = {id(part.unit): part for part in request_parts}
+        parts_by_parent: dict[int, list[_RequestPart]] = {id(unit): [] for unit in units}
+        for part in request_parts:
+            parts_by_parent[id(part.parent)].append(part)
+
+        part_results: dict[int, Any] = {}
+        reasons: list[str] = []
+
+        def mark_failed(part: _RequestPart, reason: str) -> None:
+            if reason not in reasons:
+                reasons.append(reason)
+
+        for parent in oversized_parents:
+            if "segment_too_large" not in reasons:
+                reasons.append("segment_too_large")
+        for index in oversized_requests:
+            mark_failed(parts_by_unit[id(request_units[index])], "segment_too_large")
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.total_timeout_seconds
+        attempted_requests = 0
+        pending_chunks = deque(chunks)
+        while pending_chunks:
+            if attempted_requests >= self.max_requests:
+                for remaining in pending_chunks:
+                    for unit in remaining:
+                        mark_failed(parts_by_unit[id(unit)], "request_limit")
+                break
+            remaining_seconds = deadline - loop.time()
+            if remaining_seconds <= 0:
+                for remaining in pending_chunks:
+                    for unit in remaining:
+                        mark_failed(parts_by_unit[id(unit)], "total_timeout")
+                break
+
+            chunk = pending_chunks.popleft()
+            prompt = self._input_prompt(chunk, nonce)
+            attempted_requests += 1
+            request_timeout = min(self.timeout_seconds, remaining_seconds)
+            total_timeout_limited = remaining_seconds <= self.timeout_seconds
+            try:
+                response = await asyncio.wait_for(
+                    self.context.llm_generate(
+                        chat_provider_id=self.provider_id,
+                        prompt=prompt,
+                        system_prompt=system_prompt,
+                    ),
+                    timeout=request_timeout,
+                )
+            except TimeoutError:
+                reason = "total_timeout" if total_timeout_limited else "timeout"
+                for unit in chunk:
+                    mark_failed(parts_by_unit[id(unit)], reason)
+                _LOGGER.warning("AI 翻译分段请求超时，保留该段原文")
+                if total_timeout_limited:
+                    for remaining in pending_chunks:
+                        for unit in remaining:
+                            mark_failed(parts_by_unit[id(unit)], "total_timeout")
+                    break
+                continue
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                for unit in chunk:
+                    mark_failed(parts_by_unit[id(unit)], "provider_error")
+                _LOGGER.warning("AI 翻译分段请求失败，保留该段原文（%s）", type(exc).__name__)
+                continue
+
             completion = getattr(response, "completion_text", None)
             if not isinstance(completion, str) or not completion.strip():
-                _LOGGER.warning("AI 翻译返回空结果，已回退原文")
-                return TranslationOutcome(article, False)
-            translations = self._extract_translations(completion, units)
+                for unit in chunk:
+                    mark_failed(parts_by_unit[id(unit)], "empty_response")
+                _LOGGER.warning("AI 翻译分段返回空结果，保留该段原文")
+                continue
+            translations = self._extract_translations(completion, chunk)
             if translations is None:
-                _LOGGER.warning("AI 翻译响应标记无效，已回退原文")
-                return TranslationOutcome(article, False)
+                if len(chunk) > 1:
+                    middle = len(chunk) // 2
+                    pending_chunks.appendleft(chunk[middle:])
+                    pending_chunks.appendleft(chunk[:middle])
+                    _LOGGER.warning("AI 翻译分段标记校验失败，拆分并重试该分段")
+                    continue
+                for unit in chunk:
+                    mark_failed(parts_by_unit[id(unit)], "invalid_response")
+                _LOGGER.warning("AI 翻译分段响应标记无效，保留该段原文")
+                continue
+            for unit, translation in zip(chunk, translations):
+                part_results[id(parts_by_unit[id(unit)])] = translation
 
-            title_index = 0 if title_unit is not None else None
-            translated_title = normalized.title
-            if title_index is not None and translations[title_index] is not None:
-                title_translation = self._restore_markdown(
-                    translations[title_index], title_unit, include_original=include_original
+        translated_by_id: dict[int, str] = {}
+        failed_units: set[int] = {id(parent) for parent in oversized_parents}
+        skipped_count = 0
+        unchanged_count = 0
+        translated_count = 0
+        for parent in units:
+            parts = parts_by_parent[id(parent)]
+            if not parts:
+                failed_units.add(id(parent))
+                continue
+            output: list[str] = []
+            any_translated = False
+            any_skipped = False
+            any_unchanged = False
+            any_failed = False
+            for part in parts:
+                result = part_results.get(id(part), _FAILED)
+                if result is _FAILED:
+                    any_failed = True
+                    value = part.unit.source
+                elif result is None:
+                    any_skipped = True
+                    value = part.unit.source
+                elif result is _UNCHANGED:
+                    any_unchanged = True
+                    value = part.unit.source
+                else:
+                    any_translated = True
+                    value = result
+                output.append(part.prefix + part.separator_before + value + part.suffix)
+            if any_translated:
+                translated_by_id[id(parent)] = "".join(output)
+                translated_count += 1
+            if any_failed:
+                failed_units.add(id(parent))
+            if any_unchanged:
+                unchanged_count += 1
+            elif any_skipped and not any_translated and not any_failed:
+                skipped_count += 1
+
+        # A completely failed translation returns the original object. Partial output
+        # keeps successfully translated units and leaves each failed unit untouched.
+        if unchanged_count and "unchanged_response" not in reasons:
+            reasons.append("unchanged_response")
+        if not translated_count:
+            if failed_units:
+                return TranslationOutcome(
+                    article,
+                    False,
+                    "failed",
+                    reasons[0] if reasons else "translation_failed",
+                    len(units),
+                    0,
+                    skipped_count,
+                    unchanged_count,
+                    len(failed_units),
+                    list(reasons),
                 )
-                translated_title = f"{normalized.title}\n{title_translation}" if include_original else title_translation
+            return TranslationOutcome(
+                normalized,
+                not unchanged_count,
+                "skipped",
+                "unchanged_response" if unchanged_count else "model_skipped",
+                len(units),
+                0,
+                skipped_count,
+                unchanged_count,
+                0,
+                list(reasons),
+            )
 
-            translated_by_id = {
-                id(unit): translation for unit, translation in zip(units, translations) if translation is not None
-            }
-            body_text = body
-            output_patches: list[tuple[int, int, str]] = []
+        title_index = 0 if title_unit is not None else None
+        translated_title = normalized.title
+        body_text = body
+        output_patches: list[tuple[int, int, str]] = []
+        try:
+            if title_index is not None:
+                title_translation = translated_by_id.get(id(units[title_index]))
+                if title_translation is not None:
+                    restored_title = self._restore_markdown(
+                        title_translation, title_unit, include_original=include_original
+                    )
+                    translated_title = f"{normalized.title}\n{restored_title}" if include_original else restored_title
+
             for patch in patches:
                 translated = translated_by_id.get(id(patch.unit))
                 if translated is None:
@@ -149,24 +332,126 @@ class TranslationService:
                     else _prefix_translated_lines(translated_markdown, patch.prefix, in_table=patch.in_table)
                 )
                 output_patches.append((patch.start, patch.end, replacement))
-            for start, end, replacement in sorted(output_patches, reverse=True):
-                body_text = body_text[:start] + replacement + body_text[end:]
-
-            body_blocks = [ContentBlock("markdown", text=body_text)] if body_text else []
-            return TranslationOutcome(
-                replace(
-                    normalized,
-                    title=translated_title,
-                    content_blocks=body_blocks,
-                    metadata=dict(normalized.metadata),
-                    content_hash=article.content_hash,
-                ),
-                True,
-            )
         except Exception as exc:
-            # Provider errors, timeouts, and malformed responses return the original object.
-            _LOGGER.warning("AI 翻译调用失败，已回退原文（%s）", type(exc).__name__)
-            return TranslationOutcome(article, False)
+            _LOGGER.warning("AI 翻译 Markdown 重组失败，保留原文（%s）", type(exc).__name__)
+            return TranslationOutcome(
+                article,
+                False,
+                "failed",
+                "markdown_restore_failed",
+                len(units),
+                0,
+                skipped_count,
+                unchanged_count,
+                max(1, len(units) - skipped_count - unchanged_count),
+                ["markdown_restore_failed"],
+            )
+        for start, end, replacement in sorted(output_patches, reverse=True):
+            body_text = body_text[:start] + replacement + body_text[end:]
+
+        body_blocks = [ContentBlock("markdown", text=body_text)] if body_text else []
+        is_partial = bool(failed_units or unchanged_count)
+        status = "partial" if is_partial else "translated"
+        reason = reasons[0] if reasons else ("unchanged_response" if unchanged_count else None)
+        translated_article = replace(
+            normalized,
+            title=translated_title,
+            content_blocks=body_blocks,
+            metadata=dict(normalized.metadata),
+            content_hash=article.content_hash,
+        )
+        return TranslationOutcome(
+            translated_article,
+            status == "translated",
+            status,
+            reason,
+            len(units),
+            translated_count,
+            skipped_count,
+            unchanged_count,
+            len(failed_units),
+            reasons,
+        )
+
+    @classmethod
+    def _request_parts(
+        cls, units: list[_TextUnit], nonce: str, max_chars: int
+    ) -> tuple[list[_RequestPart], list[_TextUnit]]:
+        request_parts: list[_RequestPart] = []
+        oversized: list[_TextUnit] = []
+        synthetic_index = len(units)
+        for unit in units:
+            if len(cls._input_prompt([unit], nonce)) <= max_chars:
+                request_parts.append(_RequestPart(unit, unit))
+                continue
+            if unit.markers:
+                oversized.append(unit)
+                continue
+            largest_possible_index = synthetic_index + len(unit.source)
+            largest_marker = f"[[RSS_{nonce}_U{largest_possible_index}"
+            empty_child = _TextUnit(
+                "",
+                f"{largest_marker}_BEGIN]]",
+                f"{largest_marker}_END]]",
+                f"{largest_marker}_SKIP]]",
+                {},
+                {},
+                [],
+                unit.plain_text,
+            )
+            text_limit = max_chars - len(cls._input_prompt([empty_child], nonce))
+            if text_limit < 1:
+                oversized.append(unit)
+                continue
+            pieces, separators, prefix, suffix = _split_plain_unit_source(unit.source, text_limit)
+            if len(pieces) <= 1:
+                oversized.append(unit)
+                continue
+            for index, piece in enumerate(pieces):
+                marker_index = synthetic_index
+                synthetic_index += 1
+                marker = f"[[RSS_{nonce}_U{marker_index}"
+                child = _TextUnit(
+                    piece,
+                    f"{marker}_BEGIN]]",
+                    f"{marker}_END]]",
+                    f"{marker}_SKIP]]",
+                    {},
+                    {},
+                    [],
+                    unit.plain_text,
+                )
+                request_parts.append(
+                    _RequestPart(
+                        child,
+                        unit,
+                        prefix if index == 0 else "",
+                        separators[index - 1] if index else "",
+                        suffix if index == len(pieces) - 1 else "",
+                    )
+                )
+        return request_parts, oversized
+
+    @classmethod
+    def _chunk_units(
+        cls, units: list[_TextUnit], nonce: str, max_chars: int
+    ) -> tuple[list[list[_TextUnit]], list[int]]:
+        chunks: list[list[_TextUnit]] = []
+        oversized: list[int] = []
+        current: list[_TextUnit] = []
+        for index, unit in enumerate(units):
+            if len(cls._input_prompt([unit], nonce)) > max_chars:
+                oversized.append(index)
+                continue
+            candidate = [*current, unit]
+            if current and len(cls._input_prompt(candidate, nonce)) > max_chars:
+                chunks.append(current)
+                current = [unit]
+            else:
+                current = candidate
+        if current:
+            chunks.append(current)
+        return chunks, oversized
 
     def _collect_body_units(
         self, body: str, nonce: str, first_index: int
@@ -351,7 +636,7 @@ class TranslationService:
         return f"RSS translation input. Marker nonce: {nonce}\n" + "\n".join(sections)
 
     @staticmethod
-    def _extract_translations(completion: str, units: list[_TextUnit]) -> list[str | None] | None:
+    def _extract_translations(completion: str, units: list[_TextUnit]) -> list[Any] | None:
         known_markers = {marker for unit in units for marker in (unit.start, unit.end, unit.skip, *unit.markers)}
         marker_matches = list(_RSS_MARKER.finditer(completion))
         if any(match.group(0) not in known_markers for match in marker_matches):
@@ -360,7 +645,7 @@ class TranslationService:
         if any(match.start() not in complete_marker_starts for match in _RSS_MARKER_PREFIX.finditer(completion)):
             return None
 
-        result: list[str | None] = []
+        result: list[Any] = []
         cursor = 0
         for unit in units:
             if completion.count(unit.start) != 1 or completion.count(unit.end) != 1:
@@ -368,6 +653,8 @@ class TranslationService:
             start = completion.find(unit.start, cursor)
             end = completion.find(unit.end, start + len(unit.start))
             if start < cursor or end < 0:
+                return None
+            if completion[cursor:start].strip():
                 return None
             translated = completion[start + len(unit.start) : end].strip()
             if not translated:
@@ -387,13 +674,15 @@ class TranslationService:
             if skip_count or unit.skip in translated:
                 return None
             if translated == unit.source.strip():
-                result.append(None)
+                result.append(_UNCHANGED)
                 cursor = end + len(unit.end)
                 continue
             if not TranslationService._valid_inner_markers(translated, unit):
                 return None
             result.append(translated)
             cursor = end + len(unit.end)
+        if completion[cursor:].strip():
+            return None
         return result
 
     @staticmethod
@@ -465,6 +754,37 @@ class TranslationService:
             separator = continuation.rstrip() or continuation
             return f"{original}\n{separator}\n{continuation}{translated}"
         return f"{original}\n\n{translated}"
+
+
+def _split_plain_unit_source(value: str, max_chars: int) -> tuple[list[str], list[str], str, str]:
+    words = list(re.finditer(r"\S+", value))
+    if not words:
+        return [], [], value, ""
+    prefix = value[: words[0].start()]
+    suffix = value[words[-1].end() :]
+    chunks: list[str] = []
+    separators: list[str] = []
+    current = ""
+    previous_end = words[0].start()
+    for word in words:
+        separator = value[previous_end : word.start()] if current else ""
+        text = word.group(0)
+        fragments = [text[index : index + max_chars] for index in range(0, len(text), max_chars)]
+        for fragment_index, fragment in enumerate(fragments):
+            between = separator if fragment_index == 0 else ""
+            if current and len(current) + len(between) + len(fragment) > max_chars:
+                chunks.append(current)
+                separators.append(between)
+                current = fragment
+            else:
+                current += between + fragment
+        previous_end = word.end()
+    if current:
+        chunks.append(current)
+    if len(separators) != len(chunks) - 1:
+        # This guard keeps the source mapping intact if the segmentation rules change.
+        return [value], [], "", ""
+    return chunks, separators, prefix, suffix
 
 
 def _visible_prose(tokens: list[Any]) -> str:

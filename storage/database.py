@@ -54,7 +54,8 @@ CREATE TABLE IF NOT EXISTS deliveries (
  delivery_id TEXT PRIMARY KEY, target_id TEXT NOT NULL REFERENCES targets(target_id), article_id TEXT NOT NULL REFERENCES articles(article_id) ON DELETE CASCADE,
  status TEXT NOT NULL DEFAULT 'pending', source_path TEXT NOT NULL DEFAULT '', attempts INTEGER NOT NULL DEFAULT 0, retryable INTEGER NOT NULL DEFAULT 1,
  next_attempt_at REAL NOT NULL DEFAULT 0, idempotency_key TEXT NOT NULL, platform_message_id TEXT,
- error TEXT, created_at REAL NOT NULL, updated_at REAL NOT NULL, UNIQUE(target_id,article_id), UNIQUE(idempotency_key)
+ error TEXT, translation_diagnostics TEXT NOT NULL DEFAULT '[]', created_at REAL NOT NULL, updated_at REAL NOT NULL,
+ UNIQUE(target_id,article_id), UNIQUE(idempotency_key)
 );
 CREATE INDEX IF NOT EXISTS idx_deliveries_pending ON deliveries(status,next_attempt_at);
 CREATE TABLE IF NOT EXISTS delivery_attempts (
@@ -69,7 +70,8 @@ CREATE TABLE IF NOT EXISTS delivery_batches (
 );
 CREATE TABLE IF NOT EXISTS test_operations (
  operation_id TEXT PRIMARY KEY, target_id TEXT NOT NULL REFERENCES targets(target_id), feed_id TEXT NOT NULL REFERENCES feeds(feed_id),
- article_ids TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', error TEXT, created_at REAL NOT NULL, updated_at REAL NOT NULL
+ article_ids TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', error TEXT,
+ translation_diagnostics TEXT NOT NULL DEFAULT '[]', created_at REAL NOT NULL, updated_at REAL NOT NULL
 );
 CREATE TABLE IF NOT EXISTS batch_articles (
  batch_id TEXT NOT NULL REFERENCES delivery_batches(batch_id) ON DELETE CASCADE,
@@ -138,6 +140,17 @@ class Database:
             if "retryable" not in columns:
                 await self.connection.execute("ALTER TABLE deliveries ADD COLUMN retryable INTEGER NOT NULL DEFAULT 1")
                 await self.connection.commit()
+            if "translation_diagnostics" not in columns:
+                await self.connection.execute(
+                    "ALTER TABLE deliveries ADD COLUMN translation_diagnostics TEXT NOT NULL DEFAULT '[]'"
+                )
+            test_columns = {
+                row[1] for row in await (await self.connection.execute("PRAGMA table_info(test_operations)")).fetchall()
+            }
+            if "translation_diagnostics" not in test_columns:
+                await self.connection.execute(
+                    "ALTER TABLE test_operations ADD COLUMN translation_diagnostics TEXT NOT NULL DEFAULT '[]'"
+                )
             fetch_columns = {
                 row[1] for row in await (await self.connection.execute("PRAGMA table_info(fetch_logs)")).fetchall()
             }

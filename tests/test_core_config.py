@@ -75,6 +75,10 @@ def test_retry_zero_is_valid_and_secrets_are_redacted():
         "provider_id": "",
         "include_original": True,
         "prompt": DEFAULT_TRANSLATION_PROMPT,
+        "timeout_seconds": 30.0,
+        "total_timeout_seconds": 90.0,
+        "max_segment_chars": 12_000,
+        "max_requests": 12,
     }
     assert public["general"] == {"timezone": "Asia/Shanghai", "group_admin_only": False}
 
@@ -127,7 +131,15 @@ def test_plugin_config_schema_has_groups_and_legacy_keys():
         "rsshub": {"default_url_prefix", "rsshub_access_key"},
         "telegram": {"telegraph_access_token"},
         "media": {"send_as_media"},
-        "translation": {"provider_id", "include_original", "prompt"},
+        "translation": {
+            "provider_id",
+            "include_original",
+            "prompt",
+            "timeout_seconds",
+            "total_timeout_seconds",
+            "max_segment_chars",
+            "max_requests",
+        },
     }
     defaults = {
         group: {key: item["default"] for key, item in definition["items"].items()}
@@ -153,6 +165,10 @@ def test_plugin_config_schema_has_groups_and_legacy_keys():
     assert schema["translation"]["items"]["include_original"]["default"] is True
     assert schema["translation"]["items"]["prompt"]["default"] == DEFAULT_TRANSLATION_PROMPT
     assert schema["translation"]["items"]["prompt"]["type"] == "text"
+    assert schema["translation"]["items"]["timeout_seconds"]["default"] == 30.0
+    assert schema["translation"]["items"]["total_timeout_seconds"]["default"] == 90.0
+    assert schema["translation"]["items"]["max_segment_chars"]["default"] == 12_000
+    assert schema["translation"]["items"]["max_requests"]["default"] == 12
     config = PluginConfig.from_mapping(defaults)
     assert config == PluginConfig()
 
@@ -162,18 +178,30 @@ def test_translation_config_is_grouped_strict_and_defaults_to_disabled():
     assert config.translation_provider_id == ""
     assert config.translation_include_original is True
     assert config.translation_prompt == DEFAULT_TRANSLATION_PROMPT
+    assert config.translation_timeout_seconds == 30.0
+    assert config.translation_total_timeout_seconds == 90.0
+    assert config.translation_max_segment_chars == 12_000
+    assert config.translation_max_requests == 12
     selected = PluginConfig.from_mapping(
         {
             "translation": {
                 "provider_id": "  provider-one  ",
                 "include_original": False,
                 "prompt": "  Translate to French.  ",
+                "timeout_seconds": 5,
+                "total_timeout_seconds": 15,
+                "max_segment_chars": 2048,
+                "max_requests": 4,
             }
         }
     )
     assert selected.translation_provider_id == "provider-one"
     assert selected.translation_include_original is False
     assert selected.translation_prompt == "Translate to French."
+    assert selected.translation_timeout_seconds == 5.0
+    assert selected.translation_total_timeout_seconds == 15.0
+    assert selected.translation_max_segment_chars == 2048
+    assert selected.translation_max_requests == 4
     blank = PluginConfig.from_mapping({"translation": {"prompt": "  \n  "}})
     assert blank.translation_prompt == DEFAULT_TRANSLATION_PROMPT
 
@@ -186,6 +214,10 @@ def test_translation_config_is_grouped_strict_and_defaults_to_disabled():
         {"translation": {"include_original": "false"}},
         {"translation": {"prompt": 7}},
         {"translation": {"prompt": None}},
+        {"translation": {"timeout_seconds": 0}},
+        {"translation": {"total_timeout_seconds": float("inf")}},
+        {"translation": {"max_segment_chars": 1023}},
+        {"translation": {"max_requests": 65}},
         {"translation_provider_id": None},
         {"translation_include_original": 1},
     ],

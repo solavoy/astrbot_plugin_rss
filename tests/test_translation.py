@@ -50,6 +50,21 @@ class TranslatingContext:
         return SimpleNamespace(completion_text="\n".join(output))
 
 
+def _translation_response_with_video_skip(prompt, section):
+    """Model a provider that explicitly skips its generated media-only label."""
+    output = []
+    for match in section.finditer(prompt):
+        value = match.group(2)
+        visible = re.sub(r"\[\[RSS_[^\]]+_L\d+_(?:BEGIN|END)\]\]", "", value).strip()
+        if visible == "Video":
+            value = re.sub(r"_BEGIN\]\]$", "_SKIP]]", match.group(1))
+        else:
+            for source, translated in TranslatingContext.replacements.items():
+                value = value.replace(source, translated)
+        output.append(f"{match.group(1)}\n{value}\n{match.group(3)}")
+    return "\n".join(output)
+
+
 class FakeFetcher:
     async def close(self):
         pass
@@ -355,7 +370,7 @@ async def test_translation_provider_does_not_run_for_missing_or_disabled_source(
 
 @pytest.mark.asyncio
 async def test_translation_uses_selected_provider_and_pairs_paragraphs_without_mutating_source():
-    context = TranslatingContext()
+    context = TranslatingContext(completion_transform=_translation_response_with_video_skip)
     service = TranslationService(context, "provider-one")
     source = Article(
         "article-2",
@@ -497,7 +512,7 @@ async def test_unknown_rss_marker_after_expected_sections_falls_back_to_original
 
 
 @pytest.mark.asyncio
-async def test_object_only_response_for_prose_unit_falls_back_to_original():
+async def test_object_only_response_for_prose_unit_isolated_to_that_unit():
     def remove_prose(prompt, section):
         output = []
         for match in section.finditer(prompt):
@@ -530,8 +545,13 @@ async def test_object_only_response_for_prose_unit_falls_back_to_original():
     outcome = await TranslationService(context, "provider-one").translate_article(source, include_original=False)
 
     assert outcome.succeeded is False
-    assert outcome.article is source
+    assert outcome.status == "partial"
+    assert outcome.article is not source
+    assert outcome.article.title == "一则标题"
     assert _plain_blocks(outcome.article.content_blocks) == "Original body"
+    assert "https://cdn.example.org/image.png" in _markdown(outcome.article.content_blocks)
+    assert outcome.diagnostic()["reason"] == "invalid_response"
+    assert outcome.diagnostic()["segments_failed"] == 1
 
 
 @pytest.mark.asyncio
@@ -697,9 +717,13 @@ async def test_exact_source_response_is_treated_as_skip_even_when_original_is_hi
 
     outcome = await TranslationService(context, "provider-one").translate_article(source, include_original=False)
 
-    assert outcome.succeeded is True
+    assert outcome.succeeded is False
+    assert outcome.status == "skipped"
+    assert outcome.reason == "unchanged_response"
     assert outcome.article.title == "Already English"
     assert _markdown(outcome.article.content_blocks) == blocks_to_markdown(source.content_blocks)
+    assert outcome.segments_unchanged == 2
+    assert source.metadata == {}
 
 
 @pytest.mark.asyncio
@@ -767,7 +791,7 @@ async def test_translation_cleans_discourse_footer_before_building_provider_prom
 
 @pytest.mark.asyncio
 async def test_cached_media_cleanup_prevents_view_video_label_from_being_translated():
-    context = TranslatingContext()
+    context = TranslatingContext(completion_transform=_translation_response_with_video_skip)
     video_url = "https://cdn.example.org/video.mp4"
     source = Article(
         "article-media-label",

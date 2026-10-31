@@ -261,6 +261,10 @@ class PluginConfig:
     translation_provider_id: str = ""
     translation_include_original: bool = True
     translation_prompt: str = DEFAULT_TRANSLATION_PROMPT
+    translation_timeout_seconds: float = 30.0
+    translation_total_timeout_seconds: float = 90.0
+    translation_max_segment_chars: int = 12_000
+    translation_max_requests: int = 12
     telegraph_author_name: str = ""
     telegraph_cache_enabled: bool = True
     telegraph_fallback_enabled: bool = True
@@ -338,6 +342,14 @@ class PluginConfig:
             incoming["translation_include_original"] = translation_group["include_original"]
         if "prompt" in translation_group:
             incoming["translation_prompt"] = translation_group["prompt"]
+        if "timeout_seconds" in translation_group:
+            incoming["translation_timeout_seconds"] = translation_group["timeout_seconds"]
+        if "total_timeout_seconds" in translation_group:
+            incoming["translation_total_timeout_seconds"] = translation_group["total_timeout_seconds"]
+        if "max_segment_chars" in translation_group:
+            incoming["translation_max_segment_chars"] = translation_group["max_segment_chars"]
+        if "max_requests" in translation_group:
+            incoming["translation_max_requests"] = translation_group["max_requests"]
         aliases = {
             "max_concurrent_fetches": "max_fetch_concurrency",
             "max_retries": "request_retry_limit",
@@ -435,7 +447,14 @@ class PluginConfig:
             value = getattr(self, name)
             if type(value) is not int or value < 0:
                 raise ConfigurationError(f"配置项 {name} 不能是负数")
-        for name in ("request_timeout", "browser_timeout", "media_download_timeout", "retry_backoff_base"):
+        for name in (
+            "request_timeout",
+            "browser_timeout",
+            "media_download_timeout",
+            "retry_backoff_base",
+            "translation_timeout_seconds",
+            "translation_total_timeout_seconds",
+        ):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
                 raise ConfigurationError(f"配置项 {name} 必须是有限的正数")
@@ -472,6 +491,13 @@ class PluginConfig:
                 raise ConfigurationError(f"配置项 {name} 必须是文本")
         self.translation_provider_id = self.translation_provider_id.strip()
         self.translation_prompt = normalize_translation_prompt(self.translation_prompt)
+        if (
+            type(self.translation_max_segment_chars) is not int
+            or not 1024 <= self.translation_max_segment_chars <= 100_000
+        ):
+            raise ConfigurationError("翻译分段字符上限必须是 1024 到 100000 之间的整数")
+        if type(self.translation_max_requests) is not int or not 1 <= self.translation_max_requests <= 64:
+            raise ConfigurationError("单篇文章翻译请求数必须是 1 到 64 之间的整数")
         if "\r" in self.fetch_user_agent or "\n" in self.fetch_user_agent:
             raise ConfigurationError("抓取 User-Agent 不能包含换行符")
         session_path = PurePath(self.session_storage_path)
@@ -519,6 +545,10 @@ class PluginConfig:
                 "provider_id": self.translation_provider_id,
                 "include_original": self.translation_include_original,
                 "prompt": self.translation_prompt,
+                "timeout_seconds": self.translation_timeout_seconds,
+                "total_timeout_seconds": self.translation_total_timeout_seconds,
+                "max_segment_chars": self.translation_max_segment_chars,
+                "max_requests": self.translation_max_requests,
             },
             "general": {"timezone": self.timezone, "group_admin_only": self.group_admin_only},
         }

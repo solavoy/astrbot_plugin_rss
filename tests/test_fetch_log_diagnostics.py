@@ -1,3 +1,5 @@
+import logging
+
 import pytest
 from astrbot_plugin_rss.core.config import PluginConfig
 from astrbot_plugin_rss.core.models import FetchResult
@@ -32,6 +34,11 @@ class RateLimitedFetcher:
 
     async def close(self):
         return None
+
+
+class UnexpectedFailureFetcher:
+    async def fetch(self, feed, force=False):
+        raise RuntimeError("sensitive endpoint https://secret.example/path?token=do-not-log")
 
 
 @pytest.mark.asyncio
@@ -72,5 +79,32 @@ async def test_429_fetch_log_keeps_safe_diagnostics_through_management_detail(tm
             "SELECT error_message FROM fetch_logs WHERE error_type='http_500' ORDER BY id DESC LIMIT 1"
         )
         assert len(other["error_message"]) == 300
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_unexpected_fetch_exception_logs_safe_stage_and_type(tmp_path, caplog):
+    runtime = RSSRuntime(
+        PluginConfig.from_mapping({"global_poll_interval": 1}),
+        tmp_path,
+        fetcher=UnexpectedFailureFetcher(),
+    )
+    await runtime.initialize()
+    try:
+        feed = await runtime.repository.create_feed("https://example.org/unexpected-failure")
+        target = await runtime.repository.create_target("instance", "unexpected", "test", "target")
+        await runtime.repository.add_direct_subscription(target.target_id, feed.feed_id, interval=1)
+
+        with caplog.at_level(logging.WARNING, logger="astrbot_plugin_rss.scheduler.feed_scheduler"):
+            result = await FeedScheduler(runtime).run_once()
+
+        assert result["errors"] == 1
+        assert "during fetch" in caplog.text
+        assert "RuntimeError" in caplog.text
+        assert "do-not-log" not in caplog.text
+        state = await runtime.database.fetchone("SELECT status FROM feeds WHERE feed_id=?", (feed.feed_id,))
+        assert state["status"] == "RuntimeError"
+        assert (await runtime.database.fetchone("SELECT COUNT(*) FROM fetch_logs"))[0] == 0
     finally:
         await runtime.close()
